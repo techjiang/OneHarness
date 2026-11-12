@@ -35,6 +35,17 @@ class ClassifyTests(unittest.TestCase):
         body = '{"error":{"message":"Unknown name \\"messages\\": Cannot find field."}}'
         self.assertEqual(self.check(400, body)[0], doctor.PROTOCOL)
 
+    def test_400_about_the_window_is_context_not_a_bug(self):
+        # Same status as the field-name 400 above, opposite meaning: this
+        # request was understood, it was just bigger than the window. Reading
+        # it as `protocol` sends someone into the provider adapter for nothing.
+        body = '{"error":{"message":"prompt is too long: 208310 tokens > 200000 maximum"}}'
+        verdict, _ = self.check(400, body)
+        self.assertEqual(verdict, doctor.CONTEXT)
+
+    def test_413_payload_too_large_is_context(self):
+        self.assertEqual(self.check(413, "Request Entity Too Large")[0], doctor.CONTEXT)
+
     def test_400_about_the_key_is_auth(self):
         body = '{"error":{"message":"API key not valid. Please pass a valid API key."}}'
         self.assertEqual(self.check(400, body)[0], doctor.AUTH)

@@ -301,6 +301,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("at least 1", err)
 
+    def test_negative_context_budget_is_rejected(self):
+        code, _, err = run_cli(["run", "go", "--context-budget", "-1"])
+        self.assertEqual(code, 1)
+        self.assertIn("context-budget", err)
+
+    def test_context_budget_reaches_the_agent(self):
+        script = [
+            Completion(
+                message=Message.assistant(
+                    "", [ToolCall.from_raw(call_id="c1", name="list_dir", arguments={})]
+                )
+            ),
+            Completion(message=Message.assistant("done")),
+        ]
+        captured = {}
+
+        real_agent = cli.Agent
+
+        def fake_agent(provider, tools, **kwargs):
+            captured.update(kwargs)
+            return real_agent(provider, tools, **kwargs)
+
+        with (
+            self.patch_agent(script),
+            mock.patch.object(cli, "Agent", side_effect=fake_agent),
+        ):
+            code, _, _ = run_cli(
+                ["run", "go", "--context-budget", "4096", "--workspace", str(self.root)]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["context_budget"], 4096)
+
     def test_parse_error_for_unknown_flag(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
             cli.main(["run", "hi", "--nope"])

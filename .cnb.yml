@@ -22,15 +22,7 @@ main:
                 python examples/fanout_demo.py
                 python examples/bedrock_demo.py
                 python examples/doctor_demo.py
-            - name: demos
-              script: |
-                python examples/e2e_demo.py
-                python examples/stream_demo.py
-                python examples/mcp_demo.py
-                python examples/delegate_demo.py
-                python examples/fanout_demo.py
-                python examples/bedrock_demo.py
-                python examples/doctor_demo.py
+                python examples/context_demo.py
 
   pull_request:
     - stages:
@@ -53,3 +45,4 @@ main:
                 python examples/fanout_demo.py
                 python examples/bedrock_demo.py
                 python examples/doctor_demo.py
+                python examples/context_demo.py

@@ -12,6 +12,7 @@ fault** a failure is:
     endpoint    the URL is wrong, or something between here and there is
     quota       rate limited or out of credit
     protocol    a 400 that complains about *our* field names -- a OneHarness bug
+    context     a 400/413 that says the payload is too big for the window
     network     no answer at all: DNS, TLS, proxy, timeout
     unconfigured  no credentials in the environment; not a failure
 
@@ -20,6 +21,12 @@ The distinction that earns its keep is `auth` vs `protocol`. A 401 saying
 wrong; a 400 saying "unknown name messages" means this harness is sending the
 wrong body and no amount of correct keys will fix it. Those two look equally red
 in a log and mean opposite things.
+
+`context` is the second distinction that earns its keep, and it sits inside the
+same 400 as `protocol`: "prompt is too long: 208310 tokens > 200000 maximum"
+means the request was understood and was simply bigger than the window, while
+"unknown name messages" means the request was malformed. Fixing a budget problem
+by reading the provider adapter is a day lost in the wrong file.
 
 `--record` writes the exchange to a tape so the same classified answer can be
 replayed offline later (see `oneharness/tape.py`).
@@ -34,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+from oneharness import context as context_module
 from oneharness.errors import ConfigError, OneHarnessError, ProviderError
 from oneharness.providers import PRESETS, create_provider, list_presets
 from oneharness.tape import TapeError
@@ -50,6 +58,7 @@ MODEL = "model"
 ENDPOINT = "endpoint"
 QUOTA = "quota"
 PROTOCOL = "protocol"
+CONTEXT = "context"
 NETWORK = "network"
 UNCONFIGURED = "unconfigured"
 
@@ -171,6 +180,12 @@ def classify(exc: ProviderError) -> tuple[str, str]:
         return ENDPOINT, detail
     if status == 429:
         return QUOTA, detail
+    if status == 413 or (status in (400, 422) and context_module.is_overflow(exc)):
+        # Checked before the field words: "maximum context length" reads like a
+        # complaint about our body, and it is the one 400 where nothing in this
+        # repo needs changing. 413 needs no wording at all -- "payload too
+        # large" can only be about size.
+        return CONTEXT, detail
     if status == 400:
         # Order matters: a body can mention both. Blaming our fields is the
         # claim that deserves evidence, so it is checked before the catch-all.
@@ -194,6 +209,7 @@ def _next_step(status: str) -> str:
         ENDPOINT: "nothing answered at that URL: check base_url and region",
         QUOTA: "rate limited or out of credit: wait, or use another key",
         PROTOCOL: "the provider rejected the request body itself -- this is a OneHarness bug",
+        CONTEXT: "the request was understood and was too big: set context_budget, or send less",
         NETWORK: "no answer: DNS, TLS, proxy or timeout, not a credential problem",
         UNCONFIGURED: "not configured on this machine; set the key to test it",
     }[status]

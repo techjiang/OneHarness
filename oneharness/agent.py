@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
+from oneharness import context as context_module
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.tools import Registry
@@ -44,19 +45,27 @@ class AgentResult:
     usage: Usage
     stopped_reason: str  # "done" | "max_steps"
     model: str | None = None
+    # What the budget cut on the way to the last request. Present only when
+    # something actually had to go, so a run that fitted looks as it always did.
+    trim: dict[str, int] | None = None
 
     @property
     def ok(self) -> bool:
         return self.stopped_reason == "done"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "text": self.text,
             "stopped_reason": self.stopped_reason,
             "model": self.model,
             "usage": self.usage.as_dict(),
             "steps": [step.as_dict() for step in self.steps],
         }
+        # Absent, not null, when nothing was cut: an empty object is easier to
+        # mistake for a broken run than a missing key.
+        if self.trim is not None:
+            data["trim"] = self.trim
+        return data
 
 
 class Agent:
@@ -76,17 +85,22 @@ class Agent:
         max_steps: int = 8,
         on_event: Observer | None = None,
         max_parallel: int = 1,
+        context_budget: int = 0,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
         if max_parallel < 1:
             raise ValueError("max_parallel must be at least 1")
+        if context_budget < 0:
+            raise ValueError("context_budget must be 0 (off) or at least 1")
         self.provider = provider
         self.tools = tools if isinstance(tools, Registry) else Registry(tools or ())
         self.system = system
         self.max_steps = max_steps
         self.on_event = on_event
         self.max_parallel = max_parallel
+        # 0 means unlimited: a run that fitted before keeps behaving the same.
+        self.context_budget = context_budget
 
     def run(
         self,
@@ -107,11 +121,16 @@ class Agent:
         total = Usage()
         stopped = "max_steps"
         final_text = ""
+        trim: context_module.Trim | None = None
 
         for index in range(self.max_steps):
             started = time.monotonic()
             self._emit({"type": "step_start", "step": index + 1})
-            completion = self._complete(messages, specs, stream=stream, step=index + 1)
+            completion, used = self._complete_budgeted(
+                messages, specs, stream=stream, step=index + 1
+            )
+            if used is not None:
+                trim = used
 
             total = total + completion.usage
             messages.append(completion.message)
@@ -157,6 +176,7 @@ class Agent:
             usage=total,
             stopped_reason=stopped,
             model=getattr(self.provider, "model", None),
+            trim=trim.as_dict() if trim is not None and trim.changed else None,
         )
 
     def _run_tools(self, calls: Sequence[ToolCall], *, step_index: int) -> list[ToolResult]:
@@ -211,6 +231,63 @@ class Agent:
         if prompt:
             messages.append(Message.user(prompt))
         return messages
+
+    def _complete_budgeted(
+        self,
+        messages: list[Message],
+        specs: Sequence[dict[str, Any]],
+        *,
+        stream: bool,
+        step: int,
+    ) -> tuple[Completion, context_module.Trim | None]:
+        """Send the request, shrinking the budget if the provider says it is too big.
+
+        The retry is not a transport retry: the payload itself was the problem,
+        so the same bytes would fail again. Each pass honestly reduces the
+        estimate and remembers what it cut; on success the caller can report the
+        final shape in `--json`.
+        """
+        budget = self.context_budget
+        used: context_module.Trim | None = None
+        for attempt in range(context_module.MAX_SHRINKS + 1):
+            outgoing = messages
+            if budget > 0:
+                outgoing, trim = context_module.fit(messages, budget)
+                if trim.changed:
+                    used = trim
+                    self._emit({"type": "context_trim", "step": step, **trim.as_dict()})
+            try:
+                completion = self._complete(outgoing, specs, stream=stream, step=step)
+            except ProviderError as exc:
+                if attempt == context_module.MAX_SHRINKS or not context_module.is_overflow(exc):
+                    raise
+                estimated = context_module.estimate(messages)
+                budget = context_module.shrink(budget, estimated)
+                # Retrying with a payload the provider will refuse again only
+                # hides the real problem. If the smaller budget cannot remove a
+                # single character (a lone oversized prompt has no history to
+                # elide), the window is not what has to give -- the caller's
+                # prompt is, and that is not this loop's decision to make.
+                preview, _ = context_module.fit(messages, budget)
+                if context_module.estimate(preview) >= estimated:
+                    raise ProviderError(
+                        "context overflow: the provider refused this request for size and "
+                        "there is nothing left to elide (the prompt itself is over the "
+                        "window); shorten it instead of retrying",
+                        status=exc.status,
+                        body=exc.body,
+                    ) from None
+                self._emit(
+                    {
+                        "type": "context_overflow",
+                        "step": step,
+                        "estimated": estimated,
+                        "retry_budget": budget,
+                    }
+                )
+                continue
+            return completion, used if used is not None and used.changed else None
+        raise AssertionError("unreachable: the loop returns or raises")
 
     def _complete(
         self,

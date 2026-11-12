@@ -60,6 +60,7 @@ class Delegator:
         max_parallel: int = 1,
         on_event: Observer | None = None,
         label_prefix: str = "sub",
+        context_budget: int = 0,
     ) -> None:
         registry = tools if isinstance(tools, Registry) else Registry(tools)
         # A sub agent must not be able to delegate again: recursion stays shallow
@@ -71,6 +72,9 @@ class Delegator:
         self.max_parallel = max_parallel
         self.on_event = on_event
         self.label_prefix = label_prefix
+        # A sub agent explores harder than its parent and then throws the
+        # exploring away, so it is the one that hits the window first.
+        self.context_budget = context_budget
         # Parallel runs land here at the same time; `total = total + x` is a
         # read-modify-write, so the ledger needs a lock or it silently drops
         # tokens (verified: 40 concurrent runs lost 1000 input tokens).
@@ -91,6 +95,7 @@ class Delegator:
             max_steps=self.max_steps,
             max_parallel=self.max_parallel,
             on_event=self._sub_observer(label),
+            context_budget=self.context_budget,
         )
         result = agent.run(task)
         self._account(label, result.usage)
@@ -237,8 +242,14 @@ def make_delegate_tool(
     system: str | None = None,
     max_steps: int = 6,
     max_parallel: int = 1,
+    context_budget: int = 0,
 ) -> Tool:
     """Convenience wrapper: one Delegator, one tool, no handle to keep."""
     return Delegator(
-        provider, tools, system=system, max_steps=max_steps, max_parallel=max_parallel
+        provider,
+        tools,
+        system=system,
+        max_steps=max_steps,
+        max_parallel=max_parallel,
+        context_budget=context_budget,
     ).tool()

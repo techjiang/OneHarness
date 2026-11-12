@@ -11,7 +11,7 @@ from oneharness.tape import Tape, TapeError
 from oneharness.tools import Registry, Tool, tool
 from oneharness.types import Completion, Message, StreamEvent, ToolCall, ToolResult, Usage
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "Agent",

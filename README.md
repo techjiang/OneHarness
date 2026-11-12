@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做六件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做七件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -11,7 +11,9 @@
 4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent ——
    包括一次派出去好几个；
 5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具；
-6. 能验证自己：`doctor` 用真 provider 各发一次最小请求并**判断是谁的错**，
+6. 能把一个越跑越长的工具循环塞进模型的窗口：超了就在发请求前裁，裁完还是超就
+   按 provider 的原话降预算重试，实在没得裁就停手说清楚；
+7. 能验证自己：`doctor` 用真 provider 各发一次最小请求并**判断是谁的错**，
    请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络。
 
 ```console
@@ -77,6 +79,7 @@ $ oneharness run "ping" --no-tools --quiet
 $ oneharness run "看看这个仓库" --stream
 $ oneharness run "整理这次改动" --delegate --parallel 4
 $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
+$ oneharness run "读一遍整个仓库" --context-budget 32000   # 单个请求的 token 上限
 $ oneharness run "ping" --record run.json     # 把这次的所有请求存成 tape
 $ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重放同一次
 ```
@@ -339,6 +342,7 @@ $ oneharness doctor openai anthropic gemini
 | `endpoint` | 那个 URL 没人应答 | 改 base_url / region |
 | `quota` | 限流或余额 | 等，或换 key |
 | `protocol` | provider 说**我们的字段**不对 | OneHarness 的 bug |
+| `context` | 请求被看懂了，只是超过窗口 | 设 `context_budget`，或发少一点 |
 | `network` | 根本没答：DNS / TLS / 代理 / 超时 | 查网络 |
 | `unconfigured` | 本机没配这个 key | 配了再测 |
 
@@ -346,11 +350,65 @@ $ oneharness doctor openai anthropic gemini
 400 说「unknown name messages」意味着这个 harness 发错了体，换对 key 也修不好。
 两者在日志里一样红，含义正好相反。
 
+`context` 是同一类区分的第二个例子，而且它和 `protocol` 撞在同一个 400 上：
+「prompt is too long: 208310 tokens > 200000 maximum」说明请求被理解了、只是装不下；
+去 provider 适配层找 bug 是白费一天。
+
 `unconfigured` 不算失败，退出码仍是 0——一台机器通常只有一两个 key，缺的那些不该把 CI 染红。
 
 ```console
 $ oneharness doctor --all --json     # 脚本里用
 ```
+
+## 上下文预算
+
+工具循环只会变长。每步 append 一条带调用的 assistant 消息和一条带结果的 tool 消息，
+什么都不出——于是第 2 步刚好塞下的 run，第 9 步就超了窗口，而 provider 回的是一个 400，
+读起来像「请求格式不对」而不是「预算超了」。`doctor` 以前会把它判成 `protocol`，
+也就是「这是 OneHarness 的 bug」，把人送进错误的文件里。
+
+```console
+$ oneharness run "看看这份 40KB 的日志" --context-budget 1200
+  → read_file({"path": "big.log"})
+  ✓ read_file: 2026-11-12 INFO request done ...
+  ~ context 9438→36 tokens (budget 1200, elided 1, dropped 0)
+big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉了，我手上只剩占位符。
+```
+
+两条规矩：
+
+- **裁的是请求，不是记录。** 只有发到线上的那份列表会被裁，`AgentResult.messages`
+  一条不少——一份既被截断又被当成记录的历史，比没有记录更糟。
+- **先丢最便宜的东西。** 工具结果可以再调一次拿回来，决定调用它的那段推理不行。
+  所以结果先被抹成占位符，占位符里写着发生了什么，模型能自己决定要不要重调，
+  而不是以为文件是空的。
+
+三个动作，按发生顺序：
+
+1. **发之前裁。** 老的工具结果先被 elide；还不够就从最早的整轮开始丢，但**永远不拆开
+   调用和它的结果**（留下一条孤儿 tool 消息，OpenAI 会直接拒绝），也不丢 system、
+   第一条 user 和最新的那条 user（前两个是「我是谁 / 任务是什么」，最后一个既是任务，
+   也保证裁剪后第一个非 system 消息仍是 user——Anthropic 和 Bedrock 都要求这点）。
+2. **被拒了降预算重试。** 400/413 的原文里提到 context / too long，就是尺寸问题而不是
+   格式问题。这时候用「刚发出去的那份有多大」当测量值，按 0.6 缩一轮再发。
+3. **没得裁就停。** 如果缩完预算一条消息都删不掉（比如 prompt 本身就超窗口），
+   再发一次只会拿到同一个 400。于是直接报出 provider 的原话并说明原因——为了塞进窗口
+   而丢掉用户的问题，那是在回答另一个问题。
+
+估算刻意做得很粗：字符数除以 4。它不是 tokenizer，但和 provider 无关、不会随某个
+包升级而漂移，而且对代码和 JSON（也就是工具循环的主要成分）是偏高而不是偏低。
+`--json` 里有 `trim` 字段，只在真的裁过时才出现：
+
+```json
+"trim": {"budget": 1200, "tokens_before": 9438, "tokens_after": 36, "elided": 1, "dropped": 0}
+```
+
+`context_budget` 也能写进配置（`context_budget = 32000` 或
+`ONEHARNESS_CONTEXT_BUDGET=32000`），默认 `0` = 不设上限——之前能跑通的 run
+行为完全不变。`--delegate` 的子 agent 继承同一个上限，而不是多一个会和它对不上的旋钮。
+
+`doctor` 也多了一个判定 `context`，和 `protocol` 共用同一个 400：一个说「请求被看懂了，
+只是太大」，一个说「请求本身不合法」。同样是红的，修的地方相反。
 
 ## tape：录一次真流量，之后离线重放
 
@@ -397,6 +455,7 @@ max_tokens = 4096
 system = "你是简洁的工程师，先看代码再改。"
 max_steps = 8
 max_parallel = 3             # 同一轮里的工具并发数，默认 1
+context_budget = 32000       # 单个请求的 token 上限；0（默认）= 不设上限
 
 [delegate]                   # 写了这张表就等于打开 --delegate
 max_steps = 6
@@ -405,7 +464,8 @@ max_parallel = 4             # 同时跑几个子 agent；省略则跟随 [agent
 ```
 
 环境变量优先于文件：`ONEHARNESS_PROVIDER`、`ONEHARNESS_MODEL`、`ONEHARNESS_API_KEY`、
-`ONEHARNESS_BASE_URL`、`ONEHARNESS_SYSTEM`、`ONEHARNESS_MAX_STEPS`、`ONEHARNESS_MAX_PARALLEL`。
+`ONEHARNESS_BASE_URL`、`ONEHARNESS_SYSTEM`、`ONEHARNESS_MAX_STEPS`、`ONEHARNESS_MAX_PARALLEL`、
+`ONEHARNESS_CONTEXT_BUDGET`。
 
 API Key 走各 provider 的常规变量名：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、
 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、
@@ -454,6 +514,10 @@ model = "Qwen2.5-72B-Instruct"
 
 **usage 累加。** `result.usage` 是整个 run 的总和，不是最后一轮。
 
+**裁的是请求，不是记录。** 上下文预算只在「发到线上」的那份列表上生效，
+`AgentResult.messages` 仍是一份完整的、可以拿去做下一轮 `history` 的记录。
+一份既被截断又被当成记录的历史，比没有记录更糟。
+
 **没有内置重试模型决策。** provider 层的 429/5xx 会自动退避重试（`transport.py`），
 但「模型答得不对要不要重问」属于业务判断，交给调用方。
 
@@ -489,12 +553,14 @@ oneharness/
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
+  context.py      上下文预算：估算、先 elide 工具结果、再丢整轮、溢出识别与降预算
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config
-tests/            244 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
-examples/         七个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor，都不需要 API Key
+tests/            273 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
+examples/         八个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor / context，
+                  都不需要 API Key
 ```
 
 ## 开发
@@ -506,9 +572,10 @@ $ python examples/stream_demo.py             # 流式 + 跨 chunk 的工具调�
 $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
 $ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
 $ python examples/fanout_demo.py             # 一次派三个子 agent，逐个 vs 同时
-$ python examples/bedrock_demo.py           # 签名回验 + 二进制帧流，本地假 Bedrock
-$ python examples/doctor_demo.py            # 真端点录下的 tape 上跑 doctor + record/replay 闭环
-$ ruff check oneharness tests examples   # 风格（不格式 Markdown 里的示例）
+$ python examples/bedrock_demo.py            # 签名回验 + 二进制帧流，本地假 Bedrock
+$ python examples/doctor_demo.py             # 真端点录下的 tape 上跑 doctor + record/replay 闭环
+$ python examples/context_demo.py            # 40KB 工具结果：先裁 / 被拒后重试 / 没得裁就停
+$ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```
 
 ## License

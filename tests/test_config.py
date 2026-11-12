@@ -116,6 +116,30 @@ class DelegateAndParallelConfigTests(unittest.TestCase):
         config = load_config(self.write("[delegate]\nmax_parallel = 4\n"))
         self.assertEqual(config.delegate.max_parallel, 4)
 
+    def test_max_steps_zero_in_the_file_is_an_error_not_a_default(self):
+        # Before this, `max_steps = 0` in the file fell through to the default 8
+        # and the only sign was an 8-step run somebody did not ask for.
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(self.write("max_steps = 0\n"))
+        self.assertIn("at least 1", str(ctx.exception))
+        with self.assertRaises(ConfigError):
+            load_config(self.write("[delegate]\nmax_steps = 0\n"))
+
+    def test_context_budget_from_file(self):
+        self.assertEqual(load_config(self.write("context_budget = 32000\n")).context_budget, 32000)
+        self.assertEqual(load_config(self.write("context_budget = 0\n")).context_budget, 0)
+
+    def test_context_budget_must_be_zero_or_positive(self):
+        with self.assertRaises(ConfigError):
+            load_config(self.write("context_budget = -1\n"))
+        with self.assertRaises(ConfigError):
+            load_config(self.write('context_budget = "lots"\n'))
+
+    def test_context_budget_env_override(self):
+        path = self.write("context_budget = 1000\n")
+        with mock.patch.dict(os.environ, {"ONEHARNESS_CONTEXT_BUDGET": "8000"}):
+            self.assertEqual(load_config(path).context_budget, 8000)
+
     def test_max_steps_env_below_one_is_an_error(self):
         with (
             mock.patch.dict("os.environ", {"ONEHARNESS_MAX_STEPS": "0"}),

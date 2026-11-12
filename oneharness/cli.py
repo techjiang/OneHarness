@@ -52,6 +52,12 @@ def build_parser() -> argparse.ArgumentParser:
             help="run up to N tool calls of one turn at once (default 1, sequential)",
         )
         sub.add_argument(
+            "--context-budget",
+            type=int,
+            metavar="TOKENS",
+            help="token ceiling for one request; old tool results are elided to fit",
+        )
+        sub.add_argument(
             "--delegate",
             action="store_true",
             help="expose `delegate` / `delegate_many` tools that hand work to sub agents",
@@ -135,6 +141,10 @@ def _resolve_config(args: argparse.Namespace) -> Config:
         if args.parallel < 1:
             raise ConfigError("--parallel must be at least 1")
         config.max_parallel = args.parallel
+    if getattr(args, "context_budget", None) is not None:
+        if args.context_budget < 0:
+            raise ConfigError("--context-budget must be 0 (unlimited) or a positive token count")
+        config.context_budget = args.context_budget
     if getattr(args, "delegate", False):
         config.delegate.enabled = True
     return config
@@ -161,6 +171,9 @@ def _build_agent(
             max_steps=config.delegate.max_steps,
             max_parallel=config.delegate.max_parallel or config.max_parallel,
             on_event=observer,
+            # Same model, same window: a sub agent inherits the ceiling rather
+            # than getting a second knob that can drift out of sync with it.
+            context_budget=config.context_budget,
         )
         tools.append(delegator.tool())
         tools.append(delegator.batch_tool())
@@ -172,6 +185,7 @@ def _build_agent(
         max_steps=config.max_steps,
         max_parallel=config.max_parallel,
         on_event=observer,
+        context_budget=config.context_budget,
     )
     return agent, delegator
 
@@ -274,6 +288,18 @@ def _render(event: dict[str, Any], state: dict[str, bool], stream: bool) -> None
         mark = "!" if event.get("is_error") else "✓"
         preview = str(event.get("content", "")).replace("\n", " ")[:120]
         print(f"{tag}{mark} {event['name']}: {preview}", file=sys.stderr)
+    elif kind == "context_trim":
+        print(
+            f"{tag}~ context {event['tokens_before']}→{event['tokens_after']} tokens "
+            f"(budget {event['budget']}, elided {event['elided']}, dropped {event['dropped']})",
+            file=sys.stderr,
+        )
+    elif kind == "context_overflow":
+        print(
+            f"{tag}! provider refused {event['estimated']} tokens; retrying under "
+            f"{event['retry_budget']}",
+            file=sys.stderr,
+        )
     elif kind == "mcp_tool":
         print(f"{tag}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
     elif kind == "subagent_start":
@@ -501,6 +527,7 @@ def _print_probes(probes: Sequence[doctor_module.Probe]) -> None:
         doctor_module.ENDPOINT: "✗",
         doctor_module.QUOTA: "!",
         doctor_module.PROTOCOL: "✗",
+        doctor_module.CONTEXT: "✗",
         doctor_module.NETWORK: "✗",
         doctor_module.UNCONFIGURED: "-",
     }
