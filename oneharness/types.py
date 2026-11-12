@@ -200,6 +200,10 @@ class ToolResult:
     name: str
     content: str
     is_error: bool = False
+    # How long this one call took, measured around the tool function itself.
+    # Calls in one turn can overlap, so the sum of these is not the wall clock
+    # of the turn -- keeping both numbers is what makes `--parallel` visible.
+    seconds: float = 0.0
 
     def as_message(self) -> Message:
         return Message.tool(self.tool_call_id, self.content, self.name, self.is_error)
@@ -210,6 +214,7 @@ class ToolResult:
             "name": self.name,
             "content": self.content,
             "is_error": self.is_error,
+            "seconds": round(self.seconds, 3),
         }
 
 

@@ -77,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--quiet", action="store_true", help="hide progress events")
         sub.add_argument("--stream", action="store_true", help="print tokens as they arrive")
         sub.add_argument(
+            "--timing",
+            action="store_true",
+            help="print where the run's wall clock went (model vs tools, per step)",
+        )
+        sub.add_argument(
             "--mcp",
             action="append",
             default=[],
@@ -440,6 +445,113 @@ def _report(
         print("[the answer above is incomplete]", file=sys.stderr)
 
 
+def _report_timing(result: AgentResult, delegation: dict[str, Any] | None = None) -> None:
+    """A per-step split on stderr: the answer goes to stdout, this is diagnosis.
+
+    Nothing here is rounded into agreement. `other` is whatever the loop did not
+    measure around its two waits, and it is printed even when it is the largest
+    number -- a breakdown whose parts always add up exactly is a breakdown that
+    is inventing the missing seconds.
+
+    Delegated time gets its own line because it would otherwise be filed under
+    "tools": a `delegate` call *is* a tool call, but what it waits for is
+    another agent thinking. Folding it in would make every fan-out look like a
+    slow shell.
+    """
+    timing = result.timing
+    total = timing["total_seconds"]
+    print(
+        f"[timing] {timing['steps']} step(s), {timing['tool_calls']} tool call(s), "
+        f"{_seconds(total)} total",
+        file=sys.stderr,
+    )
+    width = len(str(len(result.steps)))
+    for number, step in enumerate(result.steps, start=1):
+        line = (
+            f"{number:>{width}}  {_seconds(step.seconds):>8}  "
+            f"model {_seconds(step.model_seconds):>8}  tools {_seconds(step.tool_seconds):>8}"
+        )
+        if step.first_token_seconds is not None:
+            line += f"  first token {_seconds(step.first_token_seconds)}"
+        if step.tool_results:
+            slowest = max(step.tool_results, key=lambda item: item.seconds)
+            line += f"  slowest call {slowest.name} {_seconds(slowest.seconds)}"
+        print("     " + line, file=sys.stderr)
+
+    model = timing["model_seconds"]
+    tools = timing["tool_seconds"]
+    other = timing["unaccounted_seconds"]
+    print(
+        f"     model {_seconds(model)} ({_share(model, total)})  "
+        f"tools {_seconds(tools)} ({_share(tools, total)})  "
+        f"other {_seconds(other)} ({_share(other, total)})",
+        file=sys.stderr,
+    )
+    # Sum of every call: bigger than `tools` exactly when calls overlapped.
+    calls = timing["tool_call_seconds"]
+    if calls > tools + 0.05:
+        print(
+            f"     calls summed {_seconds(calls)} > wall clock {_seconds(tools)}: "
+            f"they overlapped, and the gap is what --parallel bought",
+            file=sys.stderr,
+        )
+    requests = timing["model_requests"]
+    if requests > timing["steps"]:
+        print(
+            f"     {requests} request(s) for {timing['steps']} step(s): "
+            f"{requests - timing['steps']} of them were refused for size and retried",
+            file=sys.stderr,
+        )
+    delegated = (delegation or {}).get("seconds") or 0.0
+    if delegated:
+        print(
+            f"     {_seconds(delegated)} of the tool time was sub agents thinking "
+            f"({(delegation or {}).get('runs', 0)} run(s)), not a slow tool",
+            file=sys.stderr,
+        )
+    if timing["first_token_seconds"] is not None:
+        print(
+            f"     first token {_seconds(timing['first_token_seconds'])} on average "
+            "(streamed steps only)",
+            file=sys.stderr,
+        )
+    slowest = timing["slowest_step"]
+    if slowest is not None:
+        print(
+            f"     slowest step {slowest['step']} at {_seconds(slowest['seconds'])}",
+            file=sys.stderr,
+        )
+    # Only worth printing when the model time is big enough to divide by: on a
+    # local fake provider this line reads 12000 tok/s, which is a unit error
+    # dressed up as a measurement.
+    firsts = timing["first_token_seconds"]
+    output = result.usage.output_tokens
+    if output and model >= 0.2:
+        if firsts is not None and model > firsts:
+            # What the model actually wrote per second, with the thinking
+            # stripped out: that is the number a shorter prompt can improve.
+            print(
+                f"     {output} output token(s) written in {_seconds(model - firsts)} "
+                f"after the first one = {output / (model - firsts):.0f} tok/s",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"     {output} output token(s) over {_seconds(model)} incl. the wait "
+                f"= {output / model:.0f} tok/s",
+                file=sys.stderr,
+            )
+
+
+def _seconds(value: float) -> str:
+    """Milliseconds below a second, seconds above: 0.004s reads as noise."""
+    return f"{value * 1000:.0f}ms" if value < 1 else f"{value:.2f}s"
+
+
+def _share(value: float, total: float) -> str:
+    return f"{value / total * 100:.0f}%" if total > 0 else "n/a"
+
+
 def _report_delegation(delegator: Delegator | None, quiet: bool = False) -> None:
     """Sub-agent tokens are not the parent's, so they get their own line.
 
@@ -489,6 +601,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Not `stream`: a streamed run whose tokens never reached stdout (a provider
     # that answers in one `done` event) still needs the answer printed here.
     _report(result, args.json, stream and observer.printed_text, delegation)
+    if args.timing and not args.json:
+        _report_timing(result, delegation)
     _report_delegation(delegator, args.quiet)
     if tape is not None and not args.quiet:
         _report_tape(tape)
@@ -537,6 +651,8 @@ def _chat(args: argparse.Namespace, config: Config, observer, stream: bool) -> i
                 print()
             else:
                 print(f"\nassistant> {result.text}\n")
+            if args.timing:
+                _report_timing(result)
     finally:
         for client in clients:
             client.close()

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from oneharness import cli
+from oneharness.tools import tool
 from oneharness.types import Completion, Message, ToolCall, Usage
 
 
@@ -395,6 +396,76 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(captured["context_budget"], 4096)
+
+    def test_timing_summary_goes_to_stderr(self):
+        script = [
+            Completion(
+                message=Message.assistant(
+                    "", [ToolCall.from_raw(call_id="c1", name="list_dir", arguments={})]
+                )
+            ),
+            Completion(message=Message.assistant("done"), usage=Usage(4, 2)),
+        ]
+        with self.patch_agent(script):
+            code, out, err = run_cli(
+                ["run", "go", "--timing", "--workspace", str(self.root), "--quiet"]
+            )
+        # --quiet silences progress events, but the summary was asked for by name
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "done")
+        self.assertIn("[timing]", err)
+        self.assertIn("model", err)
+        self.assertIn("tools", err)
+
+    def test_timing_is_off_by_default(self):
+        with self.patch_agent([Completion(message=Message.assistant("done"))]):
+            _, _, err = run_cli(["run", "go", "--workspace", str(self.root)])
+        self.assertNotIn("[timing]", err)
+
+    def test_json_carries_timing_without_the_banner(self):
+        with self.patch_agent([Completion(message=Message.assistant("done"))]):
+            code, out, err = run_cli(
+                ["run", "go", "--json", "--timing", "--workspace", str(self.root)]
+            )
+        payload = json.loads(out)  # stdout must stay a pure document
+        self.assertEqual(code, 0)
+        self.assertIn("timing", payload)
+        self.assertIn("total_seconds", payload["timing"])
+        self.assertNotIn("[timing]", err)
+
+    def test_parallel_gap_is_named_in_the_summary(self):
+        """When calls overlap the summary must say so, not just print two numbers."""
+
+        @tool
+        def pause(delay: float) -> str:
+            """Sleep for a moment."""
+            import time as _time
+
+            _time.sleep(delay)
+            return "ok"
+
+        script = [
+            Completion(
+                message=Message.assistant(
+                    "",
+                    [
+                        ToolCall.from_raw(call_id="c1", name="pause", arguments={"delay": 0.06}),
+                        ToolCall.from_raw(call_id="c2", name="pause", arguments={"delay": 0.06}),
+                    ],
+                )
+            ),
+            Completion(message=Message.assistant("done")),
+        ]
+        provider = FakeProvider(script)
+        with (
+            mock.patch.object(cli, "create_provider", return_value=provider),
+            mock.patch.object(cli, "default_tools", return_value=[pause]),
+        ):
+            code, _, err = run_cli(
+                ["run", "go", "--timing", "--parallel", "2", "--workspace", str(self.root)]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("overlapped", err)
 
     def test_parse_error_for_unknown_flag(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:

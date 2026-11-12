@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做七件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做八件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -15,7 +15,8 @@
 6. 能把一个越跑越长的工具循环塞进模型的窗口：超了就在发请求前裁，裁完还是超就
    按 provider 的原话降预算重试，实在没得裁就停手说清楚；
 7. 能验证自己：`doctor` 用真 provider 各发一次最小请求并**判断是谁的错**，
-   请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络。
+   请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络；
+8. 能说清慢在哪：`--timing` 把每一步拆成「等模型」和「等工具」，并给出首 token 时间。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -83,6 +84,7 @@ $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/
 $ oneharness run "读一遍整个仓库" --context-budget 32000   # 单个请求的 token 上限
 $ oneharness run "ping" --record run.json     # 把这次的所有请求存成 tape
 $ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重放同一次
+$ oneharness run "整理这次改动" --timing       # 每步拆成「等模型」和「等工具」
 ```
 
 `--json` 输出稳定的机器可读结构，适合挂到脚本里：
@@ -93,18 +95,23 @@ $ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重�
   "stopped_reason": "done",
   "model": "deepseek-chat",
   "usage": {"input_tokens": 24, "output_tokens": 2, "total_tokens": 26},
-  "steps": [{"text": "pong", "tool_calls": [], "tool_results": [], "usage": {...}, "seconds": 0.61}]
+  "steps": [
+    {"text": "pong", "tool_calls": [], "tool_results": [], "usage": {...},
+     "seconds": 0.61, "model_seconds": 0.61, "tool_seconds": 0.0}
+  ],
+  "timing": {"total_seconds": 0.62, "model_seconds": 0.61, "tool_seconds": 0.0, "...": "..."}
 }
 ```
 
 `--json` 与 `--delegate` 可以一起用：子 agent 的 token 单独打到 stderr，stdout 保持是纯 JSON，
-并且多出一个 `delegation` 字段：
+并且多出一个 `delegation` 字段（`seconds` 是子 agent 花掉的墙钟，会话总时间对得上）：
 
 ```json
 {
   "text": "...",
   "delegation": {
     "runs": 3,
+    "seconds": 1.84,
     "usage": {"input_tokens": 1260, "output_tokens": 174, "total_tokens": 1434},
     "by_label": {"sub-1": {"input_tokens": 420, "output_tokens": 58, "total_tokens": 478}}
   }
@@ -488,8 +495,68 @@ header 一律不录。所以 tape 里不会有 API key，回放也不需要任�
 `tests/fixtures/tapes/` 里那批文件能在 CI 跑的原因。它们不是假服务器的输出，
 是 OpenAI / Anthropic / Gemini / DeepSeek / Groq / Bedrock **真实回过的字节**。
 
-## 配置
+## 时间花在哪：`--timing`
 
+一个 run 结束只说「跑了 4 秒」。这 4 秒里可能全在等模型，也可能全在等一条 shell——
+两者的修法完全相反：前者要缩上下文或换模型，后者要收窄工具或加并发。`--timing` 把每一步拆开：
+
+```console
+$ oneharness run "跑一遍那三条命令" --timing --parallel 3
+  → run_shell({"command": "sleep 0.3 && echo hi"})
+  → run_shell({"command": "sleep 0.3 && echo hi"})
+  → run_shell({"command": "sleep 0.3 && echo hi"})
+  ✓ run_shell: exit_code=0 hi
+  ✓ run_shell: exit_code=0 hi
+  ✓ run_shell: exit_code=0 hi
+[timing] 2 step(s), 3 tool call(s), 307ms total
+     1     306ms  model      2ms  tools    303ms  slowest call run_shell 302ms
+     2       1ms  model      1ms  tools      0ms
+     model 3ms (1%)  tools 303ms (99%)  other 0ms (0%)
+     calls summed 906ms > wall clock 303ms: they overlapped, and the gap is what --parallel bought
+     slowest step 1 at 306ms
+```
+
+五件事值得说明：
+
+- **两半分开测，总量照旧。** `model_seconds` 围着 provider 请求测，`tool_seconds` 围着工具
+  那一段测，`seconds` 仍是诚实的墙钟——它不等于两者之和，差额是循环自己做的事
+  （拼消息、读历史、写终端）。**差额不会消失，也不需要消失。**
+- **单个调用的耗时是并发的证据。** 三个 0.3s 的工具并发跑，墙钟 303ms，而三个调用加起来
+  906ms。这两个数不等的时候，`--parallel` 才真的买到了东西；相等的时候它什么也没买到。
+- **首 token 时间只对流式有意义。** 一次阻塞请求没有「第一个」可测，所以这个字段在非流式
+  下**不存在**，而不是填 0——填 0 会被读成「首 token 极快」。
+- **被拒之后的重试也算进这一步。** 一个 400 白跑一趟也是真的等了，把它从统计里抹掉，
+  统计就会掩盖问题。
+- **委派的时间单独说。** `delegate` 本身是工具调用，所以它的等待落在 `tools` 里；但它等的
+  是另一个 agent 在思考。摘要会另起一行说「这 302ms 是子 agent」，否则每次 fan-out 都像是
+  工具慢——一个笃定的错误结论比没有结论更糟。
+- **重试是可见的。** `model_requests` 比 `steps` 多，说明有请求因为超过窗口被拒、降预算又
+  发了一次。一次白跑一趟的 400 也是真的等了，它不该藏在「模型花了 3 秒」里。
+
+`--json` 里是同一个东西，结构稳定：
+
+```json
+"timing": {
+  "total_seconds": 0.207,
+  "model_seconds": 0.004,
+  "tool_seconds": 0.203,
+  "tool_call_seconds": 0.404,
+  "unaccounted_seconds": 0.0,
+  "first_token_seconds": null,
+  "steps": 2,
+  "model_requests": 2,
+  "tool_calls": 2,
+  "slowest_step": {"step": 1, "seconds": 0.204}
+}
+```
+
+每个 `steps[]` 也带 `model_seconds` / `tool_seconds`，每个 `tool_results[]` 带自己的
+`seconds`。`--timing` 与 `--json` 同时给时以 JSON 为准，不打那段摘要。
+
+摘要走 stderr，答案走 stdout。一段诊断信息不该污染管道里的正文——
+`--json` 和 `--stream` 下这条规矩本来就在，`--timing` 只是又多了一个乘客。
+
+## 配置
 
 就近找 `oneharness.toml`（从当前目录逐级向上，最后看 `~/.config/`）：
 
@@ -581,6 +648,10 @@ model = "Qwen2.5-72B-Instruct"
 这是任何自写假服务器都拿不到的结论。同一条「故意发错的 OpenAI 请求体给 Gemini」
 则拿到 `protocol`，证明这个判定真的会红。
 
+**耗时是量出来的，不是估出来的。** 每一步拆成「等模型」和「等工具」两段，各有各的修法；
+差额单独列出来而不是摊进任何一段，因为「循环自己花掉的时间」也是一条信息。
+一个各部分永远严格相加的分解，等于在替没测到的部分编数字。
+
 **没有 asyncio。** 流式不需要 event loop——SSE 是按行迭代的生成器。并发只用在唯一真正值得
 并发的地方：同一轮里的多个工具调用，用线程池，且要显式 `--parallel N` 才开。provider 请求
 永远串行，因为一个 agent 的下一步依赖上一步。
@@ -602,7 +673,8 @@ oneharness/
   transport.py    urllib 封装：JSON POST + SSE + 裸字节流，带 429/5xx 退避重试
   providers/      base.py + openai.py + anthropic.py + gemini.py + bedrock.py + azure.py
   tools.py        @tool 装饰器、schema 生成、Registry
-  agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发
+  agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发，
+                  每步拆出 model / tool 两段耗时与首 token 时间
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
@@ -610,10 +682,10 @@ oneharness/
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
-  cli.py          run / chat / tools / presets / doctor / config
-tests/            289 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
-examples/         九个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools，都不需要 API Key
+  cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
+tests/            309 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
+examples/         十个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing，都不需要 API Key
 ```
 
 ## 开发
@@ -629,6 +701,7 @@ $ python examples/bedrock_demo.py            # 签名回验 + 二进制帧流，
 $ python examples/doctor_demo.py             # 真端点录下的 tape 上跑 doctor + record/replay 闭环
 $ python examples/context_demo.py            # 40KB 工具结果：先裁 / 被拒后重试 / 没得裁就停
 $ python examples/stream_tools_demo.py       # 工具调用在参数写完前露面；流断了半句话还在
+$ python examples/timing_demo.py             # 同样的墙钟、不同的元凶；并发把调用之和与墙钟拉开
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```
 

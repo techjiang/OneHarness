@@ -30,20 +30,58 @@ Observer = Callable[[dict[str, Any]], None]
 
 @dataclass(slots=True)
 class Step:
-    """One assistant turn plus the tool results it triggered."""
+    """One assistant turn plus the tool results it triggered.
+
+    A step is two waits in a row, and "2.4s" alone does not say which one hurt.
+    Waiting for the model and waiting for a tool have opposite fixes -- a
+    smaller context or a faster model on one side, a narrower tool or more
+    parallelism on the other -- so both are measured separately, and `seconds`
+    stays the honest wall clock that neither of them explains on its own.
+    """
 
     completion: Completion
     tool_results: list[ToolResult] = field(default_factory=list)
     seconds: float = 0.0
+    model_seconds: float = 0.0
+    tool_seconds: float = 0.0
+    # How many requests this step actually sent. More than one means at least
+    # one was refused for size and retried -- time that a "how long did the
+    # model take" number would otherwise hide.
+    model_requests: int = 1
+    # How long the request ran before its first byte of anything came back.
+    # Only streaming can observe it; a blocking request has no "first".
+    first_token_seconds: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "text": self.completion.text,
             "tool_calls": [call.as_dict() for call in self.completion.tool_calls],
             "tool_results": [result.as_dict() for result in self.tool_results],
             "usage": self.completion.usage.as_dict(),
             "seconds": round(self.seconds, 3),
+            "model_seconds": round(self.model_seconds, 3),
+            "tool_seconds": round(self.tool_seconds, 3),
+            "model_requests": self.model_requests,
         }
+        if self.first_token_seconds is not None:
+            data["first_token_seconds"] = round(self.first_token_seconds, 3)
+        return data
+
+
+@dataclass(slots=True)
+class ModelCall:
+    """One logical request to the provider, with what it cost in wall clock.
+
+    A single step can issue more than one request (an overflow is refused and
+    retried under a smaller budget), and all of them cost real time, so the
+    timing lives here rather than being sampled around the step.
+    """
+
+    completion: Completion
+    trim: context_module.Trim | None = None
+    seconds: float = 0.0
+    requests: int = 0
+    first_token_seconds: float | None = None
 
 
 @dataclass(slots=True)
@@ -63,10 +101,56 @@ class AgentResult:
     # is what the model had already said out loud; throwing it away because the
     # connection died would discard the only thing that arrived.
     interrupted: str | None = None
+    # Wall clock of the whole run, measured by the loop itself.
+    seconds: float = 0.0
 
     @property
     def ok(self) -> bool:
         return self.stopped_reason == "done"
+
+    @property
+    def timing(self) -> dict[str, Any]:
+        """Where the run's wall clock went, and which step owned the most of it.
+
+        `model_seconds + tool_seconds` does not have to equal `total_seconds`:
+        both halves are measured around the loop's own waits, so the difference
+        (`unaccounted_seconds`) is everything it did not wrap in a timer --
+        building messages, reading history, writing to a terminal. Publishing
+        the remainder separately is the point: a breakdown whose parts always
+        add up exactly is a breakdown that invents the numbers it cannot see.
+        """
+        model = sum(step.model_seconds for step in self.steps)
+        tools = sum(step.tool_seconds for step in self.steps)
+        # By position, not by identity: two steps of a scripted run can compare
+        # equal, and `list.index` would then report the first of them.
+        slowest = 0
+        for number, step in enumerate(self.steps, start=1):
+            if step.seconds > self.steps[slowest].seconds:
+                slowest = number - 1
+        firsts = [
+            step.first_token_seconds for step in self.steps if step.first_token_seconds is not None
+        ]
+        return {
+            "total_seconds": round(self.seconds, 3),
+            "model_seconds": round(model, 3),
+            "tool_seconds": round(tools, 3),
+            "tool_call_seconds": round(
+                sum(result.seconds for step in self.steps for result in step.tool_results), 3
+            ),
+            "unaccounted_seconds": round(max(0.0, self.seconds - model - tools), 3),
+            "first_token_seconds": round(sum(firsts) / len(firsts), 3) if firsts else None,
+            "steps": len(self.steps),
+            "model_requests": sum(step.model_requests for step in self.steps),
+            "tool_calls": sum(len(step.tool_results) for step in self.steps),
+            "slowest_step": (
+                None
+                if not self.steps
+                else {
+                    "step": slowest + 1,
+                    "seconds": round(self.steps[slowest].seconds, 3),
+                }
+            ),
+        }
 
     @property
     def interrupted_by_user(self) -> bool:
@@ -87,6 +171,7 @@ class AgentResult:
             data["trim"] = self.trim
         if self.interrupted:
             data["interrupted"] = self.interrupted
+        data["timing"] = self.timing
         return data
 
 
@@ -145,19 +230,24 @@ class Agent:
         final_text = ""
         trim: context_module.Trim | None = None
         interrupted: str | None = None
+        run_started = time.monotonic()
 
         for index in range(self.max_steps):
             started = time.monotonic()
             self._emit({"type": "step_start", "step": index + 1})
-            completion, used = self._complete_budgeted(
-                messages, specs, stream=stream, step=index + 1
-            )
-            if used is not None:
-                trim = used
+            turn = self._complete_budgeted(messages, specs, stream=stream, step=index + 1)
+            completion = turn.completion
+            if turn.trim is not None:
+                trim = turn.trim
 
             total = total + completion.usage
             messages.append(completion.message)
-            step = Step(completion=completion)
+            step = Step(
+                completion=completion,
+                model_seconds=turn.seconds,
+                model_requests=turn.requests,
+                first_token_seconds=turn.first_token_seconds,
+            )
             steps.append(step)
             self._emit(
                 {
@@ -178,6 +268,9 @@ class Agent:
                 interrupted = completion.truncated
                 stopped = "interrupted"
                 step.seconds = time.monotonic() - started
+                # No `step_end` here: the `interrupted` event is what closes a
+                # step that never finished, and emitting both would tell a
+                # watcher the step ended normally.
                 self._emit(
                     {
                         "type": "interrupted",
@@ -194,29 +287,20 @@ class Agent:
                 # number was set after the tool loop, which a final step never
                 # reaches.
                 step.seconds = time.monotonic() - started
-                self._emit(
-                    {
-                        "type": "step_end",
-                        "step": index + 1,
-                        "seconds": round(step.seconds, 3),
-                        "tool_calls": 0,
-                    }
-                )
+                self._emit_step_end(index + 1, step, tool_calls=0)
                 stopped = "done"
                 break
 
+            tools_started = time.monotonic()
             step.tool_results.extend(self._run_tools(completion.tool_calls, step_index=index + 1))
+            # The wall clock of the tool phase, not the sum of the calls in it:
+            # with `--parallel` those two numbers differ, and the difference is
+            # exactly the parallelism that was bought.
+            step.tool_seconds = time.monotonic() - tools_started
             for result in step.tool_results:
                 messages.append(result.as_message())
             step.seconds = time.monotonic() - started
-            self._emit(
-                {
-                    "type": "step_end",
-                    "step": index + 1,
-                    "seconds": round(step.seconds, 3),
-                    "tool_calls": len(completion.tool_calls),
-                }
-            )
+            self._emit_step_end(index + 1, step, tool_calls=len(completion.tool_calls))
         else:
             # Budget exhausted while the model still wanted tools.
             stopped = "max_steps"
@@ -231,6 +315,25 @@ class Agent:
             model=getattr(self.provider, "model", None),
             trim=trim.as_dict() if trim is not None and trim.changed else None,
             interrupted=interrupted,
+            seconds=time.monotonic() - run_started,
+        )
+
+    def _emit_step_end(self, number: int, step: Step, *, tool_calls: int) -> None:
+        """Close a step with both halves of its wait, not just the total.
+
+        The split is the whole point: a step that spent 3s in the model and one
+        that spent 3s in a shell look identical in a bare duration and have
+        completely different fixes.
+        """
+        self._emit(
+            {
+                "type": "step_end",
+                "step": number,
+                "seconds": round(step.seconds, 3),
+                "model_seconds": round(step.model_seconds, 3),
+                "tool_seconds": round(step.tool_seconds, 3),
+                "tool_calls": tool_calls,
+            }
         )
 
     def _run_tools(self, calls: Sequence[ToolCall], *, step_index: int) -> list[ToolResult]:
@@ -241,38 +344,43 @@ class Agent:
         tools are not assumed to be thread safe: a shell tool and a file tool
         racing on the same path is a real hazard, and the caller knows better.
         """
-        for call in calls:
-            self._emit(
-                {
-                    "type": "tool_start",
-                    "name": call.name,
-                    "id": call.id,
-                    "arguments": call.arguments,
-                }
-            )
-
         if self.max_parallel == 1 or len(calls) == 1:
-            results = []
-            for call in calls:
-                result = self.tools.execute(call)
-                results.append(result)
-                self._emit_tool_end(result)
-            return results
+            return [self._run_one(call) for call in calls]
 
         workers = min(self.max_parallel, len(calls))
         finished: dict[int, ToolResult] = {}
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="oneharness-tool") as pool:
-            futures = {
-                pool.submit(self.tools.execute, call): index for index, call in enumerate(calls)
-            }
+            futures = {pool.submit(self._run_one, call): index for index, call in enumerate(calls)}
             # Events fire as things actually finish (that is what a watcher wants
             # to see), while the returned results keep the model's own order, so
             # the message list stays predictable.
             for future in as_completed(futures):
                 result = future.result()
                 finished[futures[future]] = result
-                self._emit_tool_end(result)
         return [finished[index] for index in range(len(calls))]
+
+    def _run_one(self, call: ToolCall) -> ToolResult:
+        """Run one call, announcing it at the moment it actually starts.
+
+        The announcement used to go out for the whole batch before the first
+        tool ran, which made the event stream claim a call was running while it
+        was still queued behind another one. Now that every call carries its
+        own duration, that lie would be measurable: the gap between
+        `tool_start` and `tool_end` has to be the time the tool really spent.
+        """
+        self._emit(
+            {
+                "type": "tool_start",
+                "name": call.name,
+                "id": call.id,
+                "arguments": call.arguments,
+            }
+        )
+        started = time.monotonic()
+        result = self.tools.execute(call)
+        result.seconds = time.monotonic() - started
+        self._emit_tool_end(result)
+        return result
 
     def _emit_tool_end(self, result: ToolResult) -> None:
         self._emit(
@@ -281,6 +389,7 @@ class Agent:
                 "name": result.name,
                 "is_error": result.is_error,
                 "content": result.content,
+                "seconds": round(result.seconds, 3),
             }
         )
 
@@ -300,16 +409,23 @@ class Agent:
         *,
         stream: bool,
         step: int,
-    ) -> tuple[Completion, context_module.Trim | None]:
+    ) -> ModelCall:
         """Send the request, shrinking the budget if the provider says it is too big.
 
         The retry is not a transport retry: the payload itself was the problem,
         so the same bytes would fail again. Each pass honestly reduces the
         estimate and remembers what it cut; on success the caller can report the
         final shape in `--json`.
+
+        A refused attempt still spent seconds on the wire, so its duration is
+        added to the step rather than discarded: the point of measuring a step
+        is to explain what the run waited for, and a wasted round trip is part
+        of the answer.
         """
         budget = self.context_budget
         used: context_module.Trim | None = None
+        spent = 0.0
+        requests = 0
         for attempt in range(context_module.MAX_SHRINKS + 1):
             outgoing = messages
             if budget > 0:
@@ -317,9 +433,12 @@ class Agent:
                 if trim.changed:
                     used = trim
                     self._emit({"type": "context_trim", "step": step, **trim.as_dict()})
+            started = time.monotonic()
             try:
-                completion = self._complete(outgoing, specs, stream=stream, step=step)
+                completion, first_token = self._complete(outgoing, specs, stream=stream, step=step)
             except ProviderError as exc:
+                spent += time.monotonic() - started
+                requests += 1
                 if attempt == context_module.MAX_SHRINKS or not context_module.is_overflow(exc):
                     raise
                 estimated = context_module.estimate(messages)
@@ -347,7 +466,15 @@ class Agent:
                     }
                 )
                 continue
-            return completion, used if used is not None and used.changed else None
+            spent += time.monotonic() - started
+            requests += 1
+            return ModelCall(
+                completion=completion,
+                trim=used if used is not None and used.changed else None,
+                seconds=spent,
+                requests=requests,
+                first_token_seconds=first_token,
+            )
         raise AssertionError("unreachable: the loop returns or raises")
 
     def _complete(
@@ -357,15 +484,27 @@ class Agent:
         *,
         stream: bool,
         step: int,
-    ) -> Completion:
+    ) -> tuple[Completion, float | None]:
+        """One request; the second value is the wait until the first event.
+
+        Only streaming can report that: a blocking request returns once and has
+        no "first". Time-to-first-token is the number that separates a slow
+        model from a slow pipe -- a provider that thinks for eight seconds and
+        then writes fast looks nothing like one that starts immediately and
+        dribbles, and both feel the same when all you print is the total.
+        """
         if not stream:
-            return self.provider.complete(messages, specs)
+            return self.provider.complete(messages, specs), None
 
         text: list[str] = []
         finished: Completion | None = None
+        started = time.monotonic()
+        first_token: float | None = None
         events = self.provider.stream(messages, specs)
         try:
             for event in events:
+                if first_token is None and (event.kind != "done" or event.completion is not None):
+                    first_token = time.monotonic() - started
                 if event.kind == "text":
                     text.append(event.text)
                     self._emit({"type": "text_delta", "step": step, "text": event.text})
@@ -398,7 +537,7 @@ class Agent:
             finished = self._truncated("".join(text), STREAM_ENDED_EARLY)
         if not finished.message.content and text:
             finished.message = Message.assistant("".join(text), finished.message.tool_calls)
-        return finished
+        return finished, first_token
 
     @staticmethod
     def _truncated(text: str, reason: str) -> Completion:

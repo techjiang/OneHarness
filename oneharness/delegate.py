@@ -15,6 +15,7 @@ and "who spent what" must still be answerable afterwards.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -82,12 +83,18 @@ class Delegator:
         self._spawned = 0
         self.usage = Usage()
         self.by_label: dict[str, Usage] = {}
+        # Wall clock spent inside sub agents. It lands in the parent's tool
+        # time, because that is where the `delegate` call sits, but it is not a
+        # slow tool -- it is another agent thinking. Reporting it separately is
+        # the difference between "the shell is slow" and "the sub agent is".
+        self.seconds = 0.0
         self.runs = 0
 
     def run(self, task: str, *, label: str | None = None) -> str:
         """Run one sub agent to completion and return its final answer."""
         label = label or self._next_label()
         self._emit({"type": "subagent_start", "task": task, "label": label})
+        started = time.monotonic()
         agent = Agent(
             self.provider,
             Registry(self._inner),
@@ -98,7 +105,8 @@ class Delegator:
             context_budget=self.context_budget,
         )
         result = agent.run(task)
-        self._account(label, result.usage)
+        spent = time.monotonic() - started
+        self._account(label, result.usage, spent)
         self._emit(
             {
                 "type": "subagent_end",
@@ -106,6 +114,7 @@ class Delegator:
                 "label": label,
                 "steps": len(result.steps),
                 "usage": result.usage.as_dict(),
+                "seconds": round(spent, 3),
             }
         )
         if not result.text:
@@ -156,9 +165,10 @@ class Delegator:
         except OneHarnessError as exc:
             return f"[{label}] failed: {type(exc).__name__}: {exc}"
 
-    def _account(self, label: str, usage: Usage) -> None:
+    def _account(self, label: str, usage: Usage, seconds: float) -> None:
         with self._lock:
             self.runs += 1
+            self.seconds += seconds
             self.usage = self.usage + usage
             self.by_label[label] = self.by_label.get(label, Usage()) + usage
 
@@ -177,6 +187,7 @@ class Delegator:
     def as_dict(self) -> dict[str, Any]:
         return {
             "runs": self.runs,
+            "seconds": round(self.seconds, 3),
             "usage": self.usage.as_dict(),
             "by_label": {label: usage.as_dict() for label, usage in self.by_label.items()},
         }

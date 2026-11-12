@@ -24,6 +24,7 @@ main:
                 python examples/doctor_demo.py
                 python examples/context_demo.py
                 python examples/stream_tools_demo.py
+                python examples/timing_demo.py
 
   pull_request:
     - stages:
@@ -48,3 +49,4 @@ main:
                 python examples/doctor_demo.py
                 python examples/context_demo.py
                 python examples/stream_tools_demo.py
+                python examples/timing_demo.py
