@@ -449,8 +449,12 @@ class CliTests(unittest.TestCase):
                 message=Message.assistant(
                     "",
                     [
-                        ToolCall.from_raw(call_id="c1", name="pause", arguments={"delay": 0.06}),
-                        ToolCall.from_raw(call_id="c2", name="pause", arguments={"delay": 0.06}),
+                        # 0.15s each: run side by side that is ~0.15s of wall
+                        # clock against 0.30s of calls, a 2x gap that survives a
+                        # loaded machine. 0.06s each left the ratio near the
+                        # threshold, and this test failed under load for it.
+                        ToolCall.from_raw(call_id="c1", name="pause", arguments={"delay": 0.15}),
+                        ToolCall.from_raw(call_id="c2", name="pause", arguments={"delay": 0.15}),
                     ],
                 )
             ),

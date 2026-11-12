@@ -514,7 +514,7 @@ $ oneharness run "跑一遍那三条命令" --timing --parallel 3
      1     306ms  model      2ms  tools    303ms  slowest call run_shell 302ms
      2       1ms  model      1ms  tools      0ms
      model 3ms (1%)  tools 303ms (99%)  other 0ms (0%)
-     calls summed 906ms > wall clock 303ms: they overlapped, and the gap is what --parallel bought
+     calls summed 906ms vs wall clock 303ms: 3.0x, so they overlapped and the gap is what --parallel bought
      slowest step 1 at 306ms
 ```
 
@@ -525,6 +525,8 @@ $ oneharness run "跑一遍那三条命令" --timing --parallel 3
   （拼消息、读历史、写终端）。**差额不会消失，也不需要消失。**
 - **单个调用的耗时是并发的证据。** 三个 0.3s 的工具并发跑，墙钟 303ms，而三个调用加起来
   906ms。这两个数不等的时候，`--parallel` 才真的买到了东西；相等的时候它什么也没买到。
+  判据是**比例**（`3.0x`）而不是绝对差：早期版本写的是「比墙钟多 50ms 以上」，于是两个
+  60ms 的调用并行跑（和 120ms、墙钟 80ms）会被判成串行——机器一忙，这行提示就自己消失了。
 - **首 token 时间只对流式有意义。** 一次阻塞请求没有「第一个」可测，所以这个字段在非流式
   下**不存在**，而不是填 0——填 0 会被读成「首 token 极快」。
 - **被拒之后的重试也算进这一步。** 一个 400 白跑一趟也是真的等了，把它从统计里抹掉，
@@ -615,15 +617,22 @@ transport 里就是 `mid=True/False`。
 ### `Retry-After` 不是建议
 
 429 常常带一个 `Retry-After`，说「过多久再来」。之前的实现完全无视它，固定走
-`backoff * 2^n`：
+`backoff * 2^n`（默认 1.5s、3s……）。这不只是「等得不够久」——**它和对方的真实要求毫无
+关系，所以两个方向都会错**。同一个 429 场景，只改 header 里的数字：
 
 ```console
-$ # 服务端说 Retry-After: 3
-$ waited 0.15s for 3 hits
+# 服务端说 Retry-After: 1
+v0.9   elapsed 4.58s   ← 白等 4.6 倍，本来 2 秒能好的事拖了 4.6 秒
+v1.0   elapsed 2.08s
+
+# 服务端说 Retry-After: 5
+v0.9   elapsed 4.58s   ← 提前 0.4 秒就撞上去，还是限流
+v1.0   elapsed 10.08s
 ```
 
-**对刚请求你让一让的服务连打三次**，这不是重试，这是加重限流。现在两种形式都读
-（秒数、HTTP 日期——后者最常被忘，当成数字解析会立刻重试）：
+固定退避不是「保守」或「激进」，它是**和问题无关**：撞上限流的人继续撞，没撞的人白等。
+
+现在两种形式都读（秒数、HTTP 日期——后者最常被忘，当成数字解析会立刻重试）：
 
 ```console
 === 4. a 429 that asks for room: Retry-After is honoured, and announced ===
@@ -769,9 +778,9 @@ Ctrl-C 退出码 130。把半句话当成完整答案是一种撒谎，把已经
 「断流保留半句」这个承诺在真实网络上不成立——而测试和文档都以为它成立。
 
 **对方的退避要求优先于自己的退避算法。** `Retry-After` 说等多久就等多久（上限 30 秒），
-没有才用指数退避。在服务端刚请求让一让的时候连打三次，是把「限流」变成「封禁」的最快
-办法。而等待本身要**先说出来再等**：静默的停顿和卡死在终端上没有区别，以为卡死的人会
-Ctrl-C，那正好毁掉等待在保护的那次请求。
+没有才用指数退避。固定退避不是「保守」也不是「激进」，是**和问题无关**：对方要 1 秒时
+白等 4.6 倍，要 5 秒时提前撞上去再被限一次。而等待本身要**先说出来再等**：静默的停顿和
+卡死在终端上没有区别，以为卡死的人会 Ctrl-C，那正好毁掉等待在保护的那次请求。
 
 ## 项目结构
 

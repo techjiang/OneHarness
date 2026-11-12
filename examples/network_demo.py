@@ -115,8 +115,11 @@ def reset_mid_answer() -> None:
     def respond(conn: socket.socket) -> None:
         conn.sendall(SSE_HEAD)
         conn.sendall(delta("The timeout is "))
-        time.sleep(0.05)
         conn.sendall(delta("5 seconds"))
+        # Let the client drain before the RST: a reset discards whatever is
+        # still in the kernel's buffer, and this segment is about what happens
+        # *after* the text arrived, not about how much of it does.
+        time.sleep(0.15)
 
     with Raw(respond) as server:
         events = []
@@ -171,7 +174,11 @@ def body_cut_short() -> None:
         )
         conn.sendall(chunk(b"half of a frame"))
 
-    with Raw(respond) as server:
+    # Closed with a FIN, not an RST: an RST discards what the kernel has not
+    # delivered yet, so the client could legitimately see nothing at all. What
+    # this segment is about is a body that ends short, which needs the headers
+    # to have been observed first.
+    with Raw(respond, reset=False) as server:
         seen: list[bytes] = []
         try:
             for piece in post_chunks(server.url, {}, retries=0):
@@ -231,8 +238,9 @@ def retry_after() -> None:
     answer = reply["choices"][0]["message"]["content"]
     print("  the server asked for 1s of room, twice")
     print(f"  requests: {hits['n']}   elapsed: {elapsed:.2f}s   answer: {answer!r}")
-    print("  without the header this was 3 requests in 0.15s -- a retry storm, and")
-    print("  the kind of failure that leaves no trace beyond a rate-limit ban.")
+    print("  a fixed backoff has nothing to do with what was asked, so it is wrong in")
+    print("  both directions: at Retry-After: 1 it wastes 4.6x the wait (1.5s, 3s...),")
+    print("  and at Retry-After: 5 it comes back 0.4s early and gets throttled again.")
 
 
 def main() -> None:

@@ -298,7 +298,12 @@ class ConnectionLossTests(unittest.TestCase):
             )
             conn.sendall(b'{"partial": "yes"}')
 
-        with RawServer(respond) as server, self.assertRaises(ProviderError) as ctx:
+        # Closed with a FIN, not an RST. A reset is genuinely racy here: the
+        # kernel discards whatever is still buffered, so if the RST wins the
+        # race the client never sees the headers at all and honestly reports
+        # "before any answer". This test is about the short body, so it needs a
+        # close the client is guaranteed to observe the headers through.
+        with RawServer(respond, reset=False) as server, self.assertRaises(ProviderError) as ctx:
             post_json(server.url, {}, retries=0)
         self.assertIn("while reading the response", str(ctx.exception))
 
@@ -315,7 +320,7 @@ class ConnectionLossTests(unittest.TestCase):
             )
             conn.sendall(chunk(b"0123456789"))
 
-        with RawServer(respond) as server, self.assertRaises(ProviderError) as ctx:
+        with RawServer(respond, reset=False) as server, self.assertRaises(ProviderError) as ctx:
             list(post_chunks(server.url, {}, retries=0))
         self.assertIn("while reading the response", str(ctx.exception))
 
@@ -390,13 +395,17 @@ class RetryAfterTests(unittest.TestCase):
         # The form people forget: read as a number it would retry immediately.
         from email.utils import formatdate
 
-        url, _ = self._server(formatdate(time.time() + 1, usegmt=True))
+        # Two seconds out, not one: `formatdate` truncates to whole seconds, so a
+        # date built from `time.time() + 1` can round down to a wait of nearly
+        # zero. That is a flaky test, not a broken parser.
+        url, _ = self._server(formatdate(time.time() + 2, usegmt=True))
         started = time.monotonic()
         self.assertEqual(post_json(url, {}, retries=1, backoff=0.01), {"ok": True})
-        # `formatdate` has one-second resolution, so the real wait lands
-        # somewhere below a second. Anything above the 0.01s backoff proves the
-        # header was read as a date rather than ignored.
-        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+        # Well above the 0.01s backoff, and below the 2s asked for: proof the
+        # header was read as a date rather than parsed as a number or ignored.
+        waited = time.monotonic() - started
+        self.assertGreater(waited, 0.9)
+        self.assertLess(waited, 2.5)
 
     def test_absurd_wait_is_capped(self):
         # "come back in an hour" must not look like a frozen CLI.

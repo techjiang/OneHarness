@@ -499,12 +499,17 @@ def _report_timing(result: AgentResult, delegation: dict[str, Any] | None = None
         f"other {_seconds(other)} ({_share(other, total)})",
         file=sys.stderr,
     )
-    # Sum of every call: bigger than `tools` exactly when calls overlapped.
+    # Sum of every call against the wall clock of the phase they ran in. Two
+    # calls in 60ms each either take 120ms of wall clock (serial) or roughly 60
+    # (overlapping), so the ratio -- not the difference -- is the signal. A fixed
+    # tolerance like "bigger by 50ms" calls 60+60 vs 80 serial, which is how a
+    # slow machine quietly turned this line off.
     calls = timing["tool_call_seconds"]
-    if calls > tools + 0.05:
+    if calls > tools * 1.25:
         print(
-            f"     calls summed {_seconds(calls)} > wall clock {_seconds(tools)}: "
-            f"they overlapped, and the gap is what --parallel bought",
+            f"     calls summed {_seconds(calls)} vs wall clock {_seconds(tools)}: "
+            f"{calls / tools:.1f}x, so they overlapped and the gap is what "
+            f"--parallel bought",
             file=sys.stderr,
         )
     requests = timing["model_requests"]
