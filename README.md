@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做八件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做九件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -16,7 +16,9 @@
    按 provider 的原话降预算重试，实在没得裁就停手说清楚；
 7. 能验证自己：`doctor` 用真 provider 各发一次最小请求并**判断是谁的错**，
    请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络；
-8. 能说清慢在哪：`--timing` 把每一步拆成「等模型」和「等工具」，并给出首 token 时间。
+8. 能说清慢在哪：`--timing` 把每一步拆成「等模型」和「等工具」，并给出首 token 时间；
+9. 不把网络故障丢给上层：连接被掐断、body 比声明短、`Retry-After` 要你等——都收敛成
+   自己的错误类型和一句能读的话，退避也照对方说的等。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -556,6 +558,102 @@ $ oneharness run "跑一遍那三条命令" --timing --parallel 3
 摘要走 stderr，答案走 stdout。一段诊断信息不该污染管道里的正文——
 `--json` 和 `--stream` 下这条规矩本来就在，`--timing` 只是又多了一个乘客。
 
+## 网络断在自己手里时
+
+前面那些节都在讲 provider 的线格式差异。这一节讲另一类差异：**服务器会坏脾气**。而且它们
+坏的方式，本地假服务器一个都产生不出来——假服务器不会 TCP 重置。
+
+### 问题不在错误处理，在错误类型
+
+v0.8 承诺过「流断了，半句话还在」。写它的测试确实绿：造一个 `stream()` 抛 `ProviderError`
+的 provider，agent 循环接住、留住文本、退出码 1。
+
+但真实的连接重置**不是** `ProviderError`。它是 `ConnectionResetError`，从
+`socket.recv_into` 里冒出来，继承自 `OSError`——于是它从代码库里每一处
+`except OneHarnessError` 底下溜过去，一路到终端：
+
+```console
+$ oneharness run "hi" --stream
+The timeout is 
+Traceback (most recent call last):
+  ...
+ConnectionResetError: [Errno 104] Connection reset by peer
+```
+
+半句话留下了（它已经打到 stdout 了），但用户看到的是崩溃，不是「答案被截断了」。而
+`doctor` 连分类的机会都没有。
+
+**测试和文档互相印证，两边都错了。** 它们都在讨论一个不会在真实网络上出现的异常类型。
+
+现在 transport 把三类丢连接都收成 `ProviderError`，并且**分开说**死在哪一步：
+
+```console
+$ python3 examples/network_demo.py
+=== 1. the connection resets half-way through the answer ===
+  events that arrived before the reset: 2
+  what the caller gets: oneharness.errors.ProviderError
+  the text that came through: 'The timeout is 5 seconds'
+
+=== 2. the connection dies before any answer ===
+  the sentence: ... lost the connection before any answer: ConnectionResetError ...
+
+=== 3. a stream cut in the middle of a frame ===
+  the sentence: ... lost the connection while reading the response: ConnectionResetError ...
+```
+
+第一段是修复后的 CLI 行为：半句话留在 stdout，`[the answer above is incomplete]` 在
+stderr，退出码 1，没有 traceback。
+
+「之前」和「读到一半」必须分开：前者没东西可救，该重试；后者有半句话值得留，而且**不能
+重试**——重试会把已经说出口的话说第二遍。这个区分在 agent 循环里是一条 `if`，在
+transport 里就是 `mid=True/False`。
+
+第 2 段还挖出一个细节：urllib 把「连接被重置」包成 `URLError` 交出来，跟 DNS 失败、端口
+拒绝一模一样。但那是两件事——`cannot reach` 是请求没送到，重置是送到了对方挂了。所以
+`_unreachable` 会看一眼 `reason` 的真实类型，是连接类错误就按「丢了连接」报。
+
+### `Retry-After` 不是建议
+
+429 常常带一个 `Retry-After`，说「过多久再来」。之前的实现完全无视它，固定走
+`backoff * 2^n`：
+
+```console
+$ # 服务端说 Retry-After: 3
+$ waited 0.15s for 3 hits
+```
+
+**对刚请求你让一让的服务连打三次**，这不是重试，这是加重限流。现在两种形式都读
+（秒数、HTTP 日期——后者最常被忘，当成数字解析会立刻重试）：
+
+```console
+=== 4. a 429 that asks for room: Retry-After is honoured, and announced ===
+  announced: HTTP 429, waiting 1.00s (Retry-After) [1/2]
+  announced: HTTP 429, waiting 1.00s (Retry-After) [2/2]
+  requests: 3   elapsed: 2.00s   answer: 'pong'
+```
+
+上限 30 秒。provider 说要等一小时的话，照着等就是个卡住的 CLI——那种情况报错让人自己决定。
+
+### 等待必须说出来
+
+静默三秒跟卡死，在终端上长得一模一样。而以为卡死的人第一反应是 Ctrl-C——正好毁掉那次
+等待本来在保护的东西。所以每次等待**在开始之前**先报一句：
+
+```console
+~ HTTP 503, waiting 1.00s (Retry-After) then retrying [1/2]
+```
+
+这条提示走的是跟 tape 一样的进程级开关（`watch_retries`），不逐层传参：重试发生在
+provider 调用深处，子 agent 还会在 worker 线程上重试，一个 context 传不到那里。
+
+### 顺手：断流现在能录进 tape 了
+
+v0.9 结尾说「被掐断的流是能录进 tape 的」。**当时只在正常收尾时录。** 中途重置会抛异常，
+`_record` 那行根本走不到——恰好在最想回放的场景下，tape 是空的。
+
+现在三条路径（SSE / 二进制帧 / 普通 JSON）都在抛异常之前先把已收到的字节写进 tape。
+回放那段字节，会复现同一个截断——这是本地编不出来的证据。
+
 ## 配置
 
 就近找 `oneharness.toml`（从当前目录逐级向上，最后看 `~/.config/`）：
@@ -663,6 +761,18 @@ model = "Qwen2.5-72B-Instruct"
 **截断和中断不是失败，但要如实说。** 流断了就返回 `stopped_reason="interrupted"`，退出码 1；
 Ctrl-C 退出码 130。把半句话当成完整答案是一种撒谎，把已经到达的半句话丢掉则是另一种。
 
+**传输层之上不该有人知道 socket 是什么。** 连接重置、body 比 `Content-Length` 短、
+握手时被挂断——这些都不是本项目的错误类型，是 `OSError` 和 `http.client.HTTPException`。
+它们必须在 `transport.py` 里就变成 `ProviderError`，否则每一处
+`except OneHarnessError` 都是漏的：CLI 打 traceback，`doctor` 分不了类，agent 循环连
+「有半句话要留」都判断不了。这条是 v1.0 修的，代价是 v0.8 到 v0.9 那三个版本里，
+「断流保留半句」这个承诺在真实网络上不成立——而测试和文档都以为它成立。
+
+**对方的退避要求优先于自己的退避算法。** `Retry-After` 说等多久就等多久（上限 30 秒），
+没有才用指数退避。在服务端刚请求让一让的时候连打三次，是把「限流」变成「封禁」的最快
+办法。而等待本身要**先说出来再等**：静默的停顿和卡死在终端上没有区别，以为卡死的人会
+Ctrl-C，那正好毁掉等待在保护的那次请求。
+
 ## 项目结构
 
 ```
@@ -670,7 +780,8 @@ oneharness/
   types.py        Message / ToolCall / Completion / Usage / ToolResult / StreamEvent
   sigv4.py        AWS Signature V4：一个纯函数，两处签名（请求 + 每次重试）
   eventstream.py  vnd.amazon.eventstream 二进制帧编解码，两个 CRC 都校验
-  transport.py    urllib 封装：JSON POST + SSE + 裸字节流，带 429/5xx 退避重试
+  transport.py    urllib 封装：JSON POST + SSE + 裸字节流；丢连接收成 ProviderError，
+                  429/5xx 退避重试且优先服从 Retry-After，等待前先报一声
   providers/      base.py + openai.py + anthropic.py + gemini.py + bedrock.py + azure.py
   tools.py        @tool 装饰器、schema 生成、Registry
   agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发，
@@ -683,9 +794,10 @@ oneharness/
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
-tests/            309 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
-examples/         十个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing，都不需要 API Key
+tests/            323 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape，
+                  以及用原始 socket 造出的 TCP 重置（假服务器造不出来）
+examples/         十一个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing / network，都不需要 API Key
 ```
 
 ## 开发
@@ -702,6 +814,8 @@ $ python examples/doctor_demo.py             # 真端点录下的 tape 上跑 do
 $ python examples/context_demo.py            # 40KB 工具结果：先裁 / 被拒后重试 / 没得裁就停
 $ python examples/stream_tools_demo.py       # 工具调用在参数写完前露面；流断了半句话还在
 $ python examples/timing_demo.py             # 同样的墙钟、不同的元凶；并发把调用之和与墙钟拉开
+$ python examples/network_demo.py            # 真 socket：重置、半帧、Retry-After
+$ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```
 

@@ -10,7 +10,7 @@ import threading
 from collections.abc import Sequence
 from typing import Any
 
-from oneharness import __version__
+from oneharness import __version__, transport
 from oneharness import doctor as doctor_module
 from oneharness.agent import Agent, AgentResult
 from oneharness.builtin import default_tools
@@ -351,6 +351,18 @@ def _render(event: dict[str, Any], state: Any, stream: bool) -> None:
             f"{event['retry_budget']}",
             file=sys.stderr,
         )
+    elif kind == "provider_retry":
+        # The wait is announced *before* it is taken: three silent seconds read
+        # as a hang, and a person who thinks it hung starts Ctrl-C-ing the very
+        # run the wait was protecting.
+        status = event.get("status")
+        why = f"HTTP {status}" if status else "connection lost"
+        print(
+            f"{tag}~ {why}, waiting {_seconds(event['delay'])} "
+            f"({event['source']}) then retrying "
+            f"[{event['attempt']}/{event['retries']}]",
+            file=sys.stderr,
+        )
     elif kind == "mcp_tool":
         print(f"{tag}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
     elif kind == "interrupted":
@@ -589,7 +601,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _resolve_config(args)
     stream = args.stream and not args.json
     observer = _printer(args.quiet, stream)
-    with _tape(args) as tape:
+    with _tape(args) as tape, _retries(observer):
         tools, clients = _with_mcp(args, config, observer)
         try:
             agent, delegator = _build_agent(args, config, observer, tools)
@@ -615,7 +627,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     config = _resolve_config(args)
     stream = args.stream
     observer = _printer(args.quiet, stream)
-    with _tape(args):
+    with _tape(args), _retries(observer):
         return _chat(args, config, observer, stream)
 
 
@@ -698,6 +710,24 @@ def _tape(args: argparse.Namespace) -> Tape:
     if record:
         return Tape.record(record)
     return _NullTape()
+
+
+class _retries:
+    """Route transport retry notices to the printer for the duration of a command.
+
+    Process-wide while it lasts (a retry happens deep inside a provider call, on
+    whatever thread), and cleared afterwards: a leftover sink would let one
+    command's terminal output leak into the next caller's library code.
+    """
+
+    def __init__(self, observer: Any) -> None:
+        self.observer = observer
+
+    def __enter__(self) -> None:
+        transport.watch_retries(self.observer)
+
+    def __exit__(self, *exc: Any) -> None:
+        transport.watch_retries(None)
 
 
 class _NullTape:

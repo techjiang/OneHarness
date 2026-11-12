@@ -1,12 +1,13 @@
 import contextlib
 import io
+import json
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from oneharness.errors import ProviderError
-from oneharness.transport import _read_events, post_chunks, post_json
+from oneharness.transport import _read_events, post_chunks, post_json, post_sse
 
 
 class FlakyServer:
@@ -214,3 +215,254 @@ class StreamChunkTests(unittest.TestCase):
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
         return f"http://127.0.0.1:{httpd.server_port}/stream"
+
+
+class RawServer:
+    """A socket that answers with whatever raw bytes it is told, then closes.
+
+    `reset=True` sets SO_LINGER to 0 so `close()` sends a TCP RST instead of a
+    FIN. That difference is not cosmetic: an orderly FIN ends a chunked body and
+    the parser shrugs, while an RST raises `ConnectionResetError` out of
+    `socket.recv_into`. The bug this file now guards against only showed up with
+    the reset.
+    """
+
+    def __init__(self, respond, *, reset=True):
+        import socket
+
+        self.socket = socket
+        self.respond = respond
+        self.reset = reset
+        self.hits = 0
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(4)
+        self.url = f"http://127.0.0.1:{self.listener.getsockname()[1]}/v1/chat"
+
+    def __enter__(self):
+        threading.Thread(target=self._serve, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        with contextlib.suppress(OSError):
+            self.listener.close()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                return
+            self.hits += 1
+            with contextlib.suppress(OSError):
+                conn.recv(65536)
+                self.respond(conn)
+                if self.reset:
+                    conn.setsockopt(
+                        self.socket.SOL_SOCKET,
+                        self.socket.SO_LINGER,
+                        b"\x01\x00\x00\x00\x00\x00\x00\x00",
+                    )
+                conn.close()
+
+
+def chunk(payload):
+    return b"%x\r\n%s\r\n" % (len(payload), payload)
+
+
+def openai_delta(text):
+    return chunk(json.dumps({"choices": [{"index": 0, "delta": {"content": text}}]}).encode())
+
+
+class ConnectionLossTests(unittest.TestCase):
+    """A dying socket must never reach the caller as a socket error.
+
+    Every layer above the transport catches `OneHarnessError`. `ConnectionReset
+    Error` inherits from OSError, so it sails past all of them: the CLI printed a
+    traceback, `doctor` never classified it, and the half answer that had already
+    arrived was thrown away -- which is precisely the promise v0.8 made.
+    """
+
+    def test_json_before_any_answer_is_a_provider_error(self):
+        with RawServer(lambda conn: None) as server, self.assertRaises(ProviderError) as ctx:
+            post_json(server.url, {}, retries=0)
+        self.assertIsInstance(ctx.exception, ProviderError)
+        self.assertIn("lost the connection", str(ctx.exception))
+        self.assertIsNone(ctx.exception.status)  # not a rejection the provider sent
+
+    def test_json_body_cut_short_says_so(self):
+        def respond(conn):
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 5000\r\n\r\n"
+            )
+            conn.sendall(b'{"partial": "yes"}')
+
+        with RawServer(respond) as server, self.assertRaises(ProviderError) as ctx:
+            post_json(server.url, {}, retries=0)
+        self.assertIn("while reading the response", str(ctx.exception))
+
+    def test_sse_reset_before_any_event_is_a_provider_error(self):
+        with RawServer(lambda conn: None) as server, self.assertRaises(ProviderError) as ctx:
+            list(post_sse(server.url, {}, retries=0))
+        self.assertIn("before any answer", str(ctx.exception))
+
+    def test_chunks_body_cut_short_is_a_provider_error(self):
+        def respond(conn):
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n"
+                b"transfer-encoding: chunked\r\n\r\n"
+            )
+            conn.sendall(chunk(b"0123456789"))
+
+        with RawServer(respond) as server, self.assertRaises(ProviderError) as ctx:
+            list(post_chunks(server.url, {}, retries=0))
+        self.assertIn("while reading the response", str(ctx.exception))
+
+    def test_a_lost_connection_is_retried(self):
+        # Losing a connection before the answer is transient; treating it as
+        # fatal turns one reset into a failed run.
+        def respond(conn):
+            body = b'{"ok": true}'
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
+                b"content-length: %d\r\n\r\n%s" % (len(body), body)
+            )
+
+        with RawServer(respond) as server:
+            served = {"n": 0}
+
+            def flaky(conn):
+                served["n"] += 1
+                if served["n"] == 1:
+                    return  # hang up with nothing
+                respond(conn)
+
+            server.respond = flaky
+            self.assertEqual(post_json(server.url, {}, retries=1, backoff=0.01), {"ok": True})
+        self.assertEqual(server.hits, 2)
+
+
+class RetryAfterTests(unittest.TestCase):
+    """When a provider says how long to wait, waiting is not optional."""
+
+    def _server(self, header_value):
+        served = {"n": 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                served["n"] += 1
+                if served["n"] == 1:
+                    body = b'{"error":"slow down"}'
+                    self.send_response(429)
+                    if header_value is not None:
+                        self.send_header("retry-after", header_value)
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                body = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_port}/x", served
+
+    def test_seconds_form_is_honoured(self):
+        url, served = self._server("1")
+        started = time.monotonic()
+        self.assertEqual(post_json(url, {}, retries=1, backoff=0.01), {"ok": True})
+        self.assertGreaterEqual(time.monotonic() - started, 0.95)
+        self.assertEqual(served["n"], 2)
+
+    def test_http_date_form_is_honoured(self):
+        # The form people forget: read as a number it would retry immediately.
+        from email.utils import formatdate
+
+        url, _ = self._server(formatdate(time.time() + 1, usegmt=True))
+        started = time.monotonic()
+        self.assertEqual(post_json(url, {}, retries=1, backoff=0.01), {"ok": True})
+        # `formatdate` has one-second resolution, so the real wait lands
+        # somewhere below a second. Anything above the 0.01s backoff proves the
+        # header was read as a date rather than ignored.
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+
+    def test_absurd_wait_is_capped(self):
+        # "come back in an hour" must not look like a frozen CLI.
+        from oneharness.transport import MAX_RETRY_DELAY, _retry_after
+
+        headers = {"retry-after": "3600"}
+        self.assertEqual(min(_retry_after(headers), MAX_RETRY_DELAY), MAX_RETRY_DELAY)
+
+    def test_no_header_falls_back_to_backoff(self):
+        from oneharness.transport import _retry_after
+
+        self.assertIsNone(_retry_after({}))
+        self.assertIsNone(_retry_after(None))
+        self.assertIsNone(_retry_after({"retry-after": "not-a-number"}))
+
+
+class RetryNoticeTests(unittest.TestCase):
+    """A wait that is not announced is indistinguishable from a hang."""
+
+    def tearDown(self):
+        from oneharness.transport import watch_retries
+
+        watch_retries(None)
+
+    def test_the_wait_is_announced_before_it_is_taken(self):
+        from oneharness.transport import watch_retries
+
+        seen = []
+        watch_retries(seen.append)
+        with FlakyServer([503]) as server:
+            post_json(server.url, {}, retries=1, backoff=0.05)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["type"], "provider_retry")
+        self.assertEqual(seen[0]["status"], 503)
+        self.assertEqual(seen[0]["attempt"], 1)
+        self.assertEqual(seen[0]["retries"], 1)
+
+    def test_retry_after_is_named_as_the_source(self):
+        from oneharness.transport import watch_retries
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            hits = 0
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                Handler.hits += 1
+                status = 429 if Handler.hits == 1 else 200
+                body = b'{"ok": true}' if status == 200 else b'{"error":"later"}'
+                self.send_response(status)
+                if status == 429:
+                    self.send_header("retry-after", "0")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        seen = []
+        watch_retries(seen.append)
+        post_json(f"http://127.0.0.1:{httpd.server_port}/x", {}, retries=1, backoff=5)
+        self.assertEqual(seen[0]["source"], "Retry-After")
+        self.assertEqual(seen[0]["delay"], 0.0)
