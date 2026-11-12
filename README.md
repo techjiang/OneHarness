@@ -7,7 +7,8 @@
 1. 把 OpenAI / Anthropic / Gemini 三种线格式抹平成同一个 `Completion`；
 2. 跑「模型要调工具 → 执行 → 结果回灌 → 再问」这个循环，且不让工具的错误炸掉循环；
 3. 支持流式输出，并且能在工具调用跨多个 chunk 时把它拼回来；
-4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent；
+4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent ——
+   包括一次派出去好几个；
 5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具。
 
 ```console
@@ -86,7 +87,21 @@ $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/
 }
 ```
 
-`--json` 与 `--delegate` 可以一起用：子 agent 的 token 单独打到 stderr，stdout 保持是纯 JSON。
+`--json` 与 `--delegate` 可以一起用：子 agent 的 token 单独打到 stderr，stdout 保持是纯 JSON，
+并且多出一个 `delegation` 字段：
+
+```json
+{
+  "text": "...",
+  "delegation": {
+    "runs": 3,
+    "usage": {"input_tokens": 1260, "output_tokens": 174, "total_tokens": 1434},
+    "by_label": {"sub-1": {"input_tokens": 420, "output_tokens": 58, "total_tokens": 478}}
+  }
+}
+```
+
+父 agent 没有委派时这个字段不出现——空对象比缺字段更容易让人以为坏掉了。
 
 退出码：`0` 正常收尾，`1` 配置/网络/工具链出错或步数耗尽，`2` 参数错误（argparse 惯例）。
 
@@ -150,20 +165,20 @@ prefix = "fs."     # 可选；两个 server 有同名工具时用它区分
 ```console
 $ oneharness run "看看这个仓库的超时配置合不合理" --delegate
   → delegate({"task": "读取 app.conf 和 notes.md，告诉我超时配了多少"})
-  ⇢ sub agent: 读取 app.conf 和 notes.md，告诉我超时配了多少
-        → read_file({"path": "app.conf"})
-        ✓ read_file: timeout=5
-        → read_file({"path": "notes.md"})
-        ✓ read_file: - 5 秒对真实请求太短 - 目标是 30 秒
-  ⇠ sub agent done: 3 step(s), 660 tokens
+  [sub-1] ⇢ 读取 app.conf 和 notes.md，告诉我超时配了多少
+      [sub-1] → read_file({"path": "app.conf"})
+      [sub-1] ✓ read_file: timeout=5
+      [sub-1] → read_file({"path": "notes.md"})
+      [sub-1] ✓ read_file: - 5 秒对真实请求太短 - 目标是 30 秒
+  [sub-1] ⇠ done: 3 step(s), 660 tokens
   ✓ delegate: app.conf: timeout=5；notes.md 里写着 5 秒对真实请求太短。结论：需要调大。
 [delegated 1 task(s): 580 in / 80 out tokens]
 ```
 
 三件事值得说明：
 
-- **子 agent 不能再委派。** `delegate` 工具在建子 agent 时就被剔除了，递归深度靠结构保证，
-  不靠一个没人检查的计数器。
+- **子 agent 不能再委派。** `delegate` / `delegate_many` 在建子 agent 时就被剔除了，
+  递归深度靠结构保证，不靠一个没人检查的计数器。
 - **花费单独记账。** 上面那行 `[delegated ...]` 是子 agent 自己的 token 数，不并进父 agent 的
   `result.usage`。「父花了 2 分、子花了 3 毛」是个应该能看见的事实。
 - **子 agent 没答案不算成功。** 它烧完 `max_steps` 还是没给结论时，父 agent 收到的是一条
@@ -175,11 +190,51 @@ $ oneharness run "看看这个仓库的超时配置合不合理" --delegate
 from oneharness import Agent, Delegator, Registry, create_provider, default_tools
 
 provider = create_provider("openai")
-delegator = Delegator(provider, default_tools("."), max_steps=6)
-agent = Agent(provider, Registry([*default_tools("."), delegator.tool()]))
+delegator = Delegator(provider, default_tools("."), max_steps=6, max_parallel=4)
+agent = Agent(provider, Registry([*default_tools("."), delegator.tool(), delegator.batch_tool()]))
 print(agent.run("把 README 的错别字都找出来改成 PR").text)
-print(delegator.runs, delegator.usage.as_dict())   # 子 agent 花了多少
+print(delegator.as_dict())   # {"runs": 3, "usage": {...}, "by_label": {...}}
 ```
+
+## 一次派好几个子 agent
+
+`--delegate` 同时给出 `delegate_many(tasks)`：一个工具调用，N 个子 agent，**一次 spawn 完**。
+它和在一个回合里连调三次 `delegate` 的区别不是写法好看，而是那三次调用能不能重叠——
+`--parallel` 管的是同一轮的工具调用，所以 `delegate` 攒一批才会有意义。
+
+```console
+$ oneharness run "同时查这三件事，最后汇总" --shell --delegate --parallel 3
+  → delegate_many({"tasks": ["app.conf 里的 timeout 是多少？", ...]})
+  [sub-1] ⇢ app.conf 里的 timeout 是多少？
+  [sub-2] ⇢ notes.md 里的结论是什么？
+  [sub-3] ⇢ README 有没有提到 0.4？
+      [sub-3] → run_shell({"command": "sleep 0.7 && cat README.md"})
+      [sub-2] → run_shell({"command": "sleep 0.7 && cat notes.md"})
+      [sub-1] → run_shell({"command": "sleep 0.7 && cat app.conf"})
+      [sub-3] ✓ run_shell: exit_code=0 # demo  版本 0.3.0
+      [sub-1] ✓ run_shell: exit_code=0 timeout=5
+      [sub-2] ✓ run_shell: exit_code=0 - 5 秒对真实请求太短
+  [sub-3] ⇠ done: 2 step(s), 478 tokens
+  [sub-1] ⇠ done: 2 step(s), 478 tokens
+  [sub-2] ⇠ done: 2 step(s), 478 tokens
+  ✓ delegate_many: [sub-1] alpha: 读完了 app.conf [sub-2] beta: ... [sub-3] gamma: ...
+[delegated 3 task(s): 1260 in / 174 out tokens]
+  sub-1: 420 in / 58 out
+  sub-2: 420 in / 58 out
+  sub-3: 420 in / 58 out
+```
+
+`--parallel 1` 跑 2.19s，`--parallel 3` 跑 0.78s（`examples/fanout_demo.py` 实测）。
+三个子 agent 的输出交错在一起时，**行首的 `[sub-N]` 是唯一能分辨谁是谁的东西**，
+所以每个 run 都有标签，`--json` 里也有 `delegation.by_label` 的单独账目。
+
+三条规矩：
+
+- **返回顺序 = 请求顺序。** 谁先跑完谁先说会让父模型的上下文每次都不一样，这种噪声没有价值。
+- **一个子 agent 失败不沉掉整批。** 那一行写 `[sub-2] failed: ...`，其余答案照常回来。
+  父模型能看见谁没成，自己决定要不要补。
+- **标签是并发的报警器。** 上一版为了并行委派临时加了锁才发现：`usage = usage + x`
+  是读-改-写，40 个并发 run 会静默丢 1000 个 input token。记账加锁不是洁癖，是它真的会掉。
 
 ## 并发工具
 
@@ -221,6 +276,7 @@ max_parallel = 3             # 同一轮里的工具并发数，默认 1
 
 [delegate]                   # 写了这张表就等于打开 --delegate
 max_steps = 6
+max_parallel = 4             # 同时跑几个子 agent；省略则跟随 [agent] max_parallel
 # system = "只回答结果，不要复述任务。"
 ```
 
@@ -283,13 +339,13 @@ oneharness/
   providers/      base.py + openai.py + anthropic.py + gemini.py
   tools.py        @tool 装饰器、schema 生成、Registry
   agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发
-  delegate.py     子 agent：独立上下文、独立记账、不能再委派
+  delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / config
-tests/            147 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
-examples/         四个离线 demo：e2e / stream / mcp / delegate，都不需要 API Key
+tests/            161 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
+examples/         五个离线 demo：e2e / stream / mcp / delegate / fanout，都不需要 API Key
 ```
 
 ## 开发
@@ -300,6 +356,7 @@ $ python examples/e2e_demo.py                # 端到端，起本地假 provider
 $ python examples/stream_demo.py             # 流式 + 跨 chunk 的工具调用
 $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
 $ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
+$ python examples/fanout_demo.py             # 一次派三个子 agent，逐个 vs 同时
 $ ruff check oneharness tests examples   # 风格（不格式 Markdown 里的示例）
 ```
 

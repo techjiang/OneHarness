@@ -182,7 +182,8 @@ class CliTests(unittest.TestCase):
             code, out, err = run_cli(["run", "go", "--delegate", "--workspace", str(self.root)])
         self.assertEqual(code, 0)
         self.assertIn("delegate", seen["tools"])
-        self.assertIn("sub agent", err)
+        self.assertIn("delegate_many", seen["tools"])
+        self.assertIn("[sub-1]", err)
         self.assertIn("delegated 1 task", err)
         self.assertEqual(out.strip(), "1 file")
 
@@ -221,7 +222,7 @@ class CliTests(unittest.TestCase):
             observe({"type": "text_delta", "text": "answer"})
         self.assertNotIn("spliced", out.getvalue())
         self.assertIn("answer", out.getvalue())
-        self.assertIn("sub agent", err.getvalue())
+        self.assertIn("⇢ go", err.getvalue())
 
     def test_stream_with_delegate_prints_the_answer_once(self):
         class TwoTurn:
@@ -260,10 +261,43 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertEqual(out.count("parent answer"), 1)
-        self.assertIn("sub agent", err)
+        self.assertIn("⇢ say hi", err)
 
     def test_parallel_rejects_zero(self):
         code, _, err = run_cli(["run", "go", "--parallel", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("at least 1", err)
+
+    def test_delegation_numbers_land_in_json(self):
+        class TwoTurn:
+            name = "fake"
+            model = "fake-1"
+
+            def __init__(self):
+                self.turn = 0
+
+            def complete(self, messages, tools=None):
+                self.turn += 1
+                if self.turn == 1:
+                    call = ToolCall.from_raw(
+                        call_id="c1", name="delegate", arguments={"task": "look"}
+                    )
+                    return Completion(message=Message.assistant("", [call]))
+                return Completion(message=Message.assistant("done"), usage=Usage(7, 3))
+
+        with mock.patch.object(cli, "create_provider", return_value=TwoTurn()):
+            code, out, err = run_cli(
+                ["run", "go", "--delegate", "--json", "--workspace", str(self.root)]
+            )
+        payload = json.loads(out)  # stdout must stay parseable
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["text"], "done")
+        self.assertEqual(payload["delegation"]["runs"], 1)
+        self.assertEqual(payload["delegation"]["usage"]["input_tokens"], 7)
+        self.assertIn("delegated 1 task", err)
+
+    def test_max_steps_zero_is_rejected_not_ignored(self):
+        code, _, err = run_cli(["run", "go", "--max-steps", "0"])
         self.assertEqual(code, 1)
         self.assertIn("at least 1", err)
 

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import threading
 import time
@@ -30,7 +31,10 @@ class FlakyServer:
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                # The client may already have given up; that is the point of the
+                # timeout test, not a server bug.
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(payload)
 
             def log_message(self, *args):
                 pass

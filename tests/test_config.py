@@ -108,6 +108,21 @@ class DelegateAndParallelConfigTests(unittest.TestCase):
         self.assertEqual(load_config(self.write("max_parallel = 0\n")).max_parallel, 1)
         self.assertEqual(load_config(self.write("max_parallel = 4\n")).max_parallel, 4)
 
+    def test_delegate_max_parallel_defaults_to_inheritance(self):
+        config = load_config(self.write("[delegate]\n"))
+        self.assertEqual(config.delegate.max_parallel, 0)  # 0 = use the top-level value
+
+    def test_delegate_max_parallel_from_file(self):
+        config = load_config(self.write("[delegate]\nmax_parallel = 4\n"))
+        self.assertEqual(config.delegate.max_parallel, 4)
+
+    def test_max_steps_env_below_one_is_an_error(self):
+        with (
+            mock.patch.dict("os.environ", {"ONEHARNESS_MAX_STEPS": "0"}),
+            self.assertRaises(ConfigError),
+        ):
+            load_config(self.write("max_steps = 2\n"))
+
     def test_max_parallel_env_override(self):
         path = self.write("max_parallel = 2\n")
         with mock.patch.dict(os.environ, {"ONEHARNESS_MAX_PARALLEL": "5"}):

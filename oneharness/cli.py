@@ -6,6 +6,7 @@ import argparse
 import json
 import shlex
 import sys
+import threading
 from collections.abc import Sequence
 from typing import Any
 
@@ -51,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument(
             "--delegate",
             action="store_true",
-            help="expose a `delegate` tool that hands a task to a sub agent",
+            help="expose `delegate` / `delegate_many` tools that hand work to sub agents",
         )
         sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         sub.add_argument("--quiet", action="store_true", help="hide progress events")
@@ -88,7 +89,9 @@ def _resolve_config(args: argparse.Namespace) -> Config:
         config.provider.model = args.model
     if getattr(args, "system", None):
         config.system = args.system
-    if getattr(args, "max_steps", None):
+    if getattr(args, "max_steps", None) is not None:
+        if args.max_steps < 1:
+            raise ConfigError("--max-steps must be at least 1")
         config.max_steps = args.max_steps
     if getattr(args, "parallel", None) is not None:
         if args.parallel < 1:
@@ -118,10 +121,11 @@ def _build_agent(
             tools,
             system=config.delegate.system,
             max_steps=config.delegate.max_steps,
-            max_parallel=config.max_parallel,
+            max_parallel=config.delegate.max_parallel or config.max_parallel,
             on_event=observer,
         )
         tools.append(delegator.tool())
+        tools.append(delegator.batch_tool())
 
     agent = Agent(
         provider,
@@ -186,57 +190,76 @@ def _printer(quiet: bool, stream: bool = False):
 
     Streaming puts tokens on stdout without newlines, so anything printed to
     stderr in between would land on the same visual line; close the line first.
-    Sub-agent events arrive with `depth: 1` and get indented, because a nested
-    run that looks identical to the parent run is just noise.
+
+    Sub-agent events arrive with `depth: 1` and a `label`, and get indented and
+    tagged: three sub agents interleaving their steps in one unmarked column is
+    unreadable, and the tag is what makes the parallelism legible. Those events
+    come from several threads at once, so the whole thing sits behind one lock.
     """
-    open_line = False
+    state = {"open_line": False}
+    lock = threading.Lock()
 
     def observe(event: dict[str, Any]) -> None:
-        nonlocal open_line
         if quiet:
             return
-        kind = event.get("type")
-        pad = "    " * int(event.get("depth", 0))
-        label = f"{pad}    " if pad else "  "
-
-        if kind == "text_delta" and stream:
-            # A sub agent's tokens are not the answer the user asked for; they
-            # would splice straight into the parent's sentence on stdout.
-            if not event.get("depth"):
-                print(event.get("text", ""), end="", flush=True)
-                open_line = True
-            return
-
-        if open_line:
-            print(flush=True)  # keep streamed text and tool chatter on separate lines
-            open_line = False
-
-        if kind == "tool_start":
-            args = json.dumps(event.get("arguments", {}), ensure_ascii=False)
-            print(f"{label}→ {event['name']}({args})", file=sys.stderr)
-        elif kind == "tool_end":
-            mark = "!" if event.get("is_error") else "✓"
-            preview = str(event.get("content", "")).replace("\n", " ")[:120]
-            print(f"{label}{mark} {event['name']}: {preview}", file=sys.stderr)
-        elif kind == "mcp_tool":
-            print(f"{label}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
-        elif kind == "subagent_start":
-            task = str(event.get("task", "")).replace("\n", " ")
-            print(f"{pad}  ⇢ sub agent: {task[:100]}", file=sys.stderr)
-        elif kind == "subagent_end":
-            usage = event.get("usage") or {}
-            print(
-                f"{pad}  ⇠ sub agent done: {event.get('steps')} step(s), "
-                f"{usage.get('total_tokens', 0)} tokens",
-                file=sys.stderr,
-            )
+        with lock:
+            _render(event, state, stream)
 
     return observe
 
 
-def _report(result: AgentResult, as_json: bool, streamed: bool = False) -> None:
+def _render(event: dict[str, Any], state: dict[str, bool], stream: bool) -> None:
+    kind = event.get("type")
+    depth = int(event.get("depth", 0))
+    label = event.get("label")
+    pad = "    " * depth
+    tag = f"{pad}[{label}] " if label else pad
+
+    if kind == "text_delta" and stream:
+        # A sub agent's tokens are not the answer the user asked for; they
+        # would splice straight into the parent's sentence on stdout.
+        if not depth:
+            print(event.get("text", ""), end="", flush=True)
+            state["open_line"] = True
+        return
+
+    if state["open_line"]:
+        print(flush=True)  # keep streamed text and tool chatter on separate lines
+        state["open_line"] = False
+
+    if kind == "tool_start":
+        args = json.dumps(event.get("arguments", {}), ensure_ascii=False)
+        if len(args) > 140:
+            args = args[:137] + "..."
+        print(f"{tag}→ {event['name']}({args})", file=sys.stderr)
+    elif kind == "tool_end":
+        mark = "!" if event.get("is_error") else "✓"
+        preview = str(event.get("content", "")).replace("\n", " ")[:120]
+        print(f"{tag}{mark} {event['name']}: {preview}", file=sys.stderr)
+    elif kind == "mcp_tool":
+        print(f"{tag}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
+    elif kind == "subagent_start":
+        task = str(event.get("task", "")).replace("\n", " ")
+        print(f"{tag}⇢ {task[:100]}", file=sys.stderr)
+    elif kind == "subagent_end":
+        usage = event.get("usage") or {}
+        print(
+            f"{tag}⇠ done: {event.get('steps')} step(s), {usage.get('total_tokens', 0)} tokens",
+            file=sys.stderr,
+        )
+
+
+def _report(
+    result: AgentResult,
+    as_json: bool,
+    streamed: bool = False,
+    delegation: dict[str, Any] | None = None,
+) -> None:
     if as_json:
-        print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+        payload = result.as_dict()
+        if delegation is not None:
+            payload["delegation"] = delegation
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
     if streamed and result.text:
         print()  # tokens already went to stdout; just close the line
@@ -263,6 +286,14 @@ def _report_delegation(delegator: Delegator | None, quiet: bool = False) -> None
         f"{usage.input_tokens} in / {usage.output_tokens} out tokens]",
         file=sys.stderr,
     )
+    # Per-sub-agent numbers only when there is more than one: a single run would
+    # just repeat the total on a second line.
+    if delegator.runs > 1:
+        for label, spent in delegator.by_label.items():
+            print(
+                f"  {label}: {spent.input_tokens} in / {spent.output_tokens} out",
+                file=sys.stderr,
+            )
 
 
 def _with_mcp(
@@ -285,7 +316,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         for client in clients:
             client.close()
-    _report(result, args.json, stream)
+    delegation = delegator.as_dict() if delegator is not None and delegator.runs else None
+    _report(result, args.json, stream, delegation)
     _report_delegation(delegator, args.quiet)
     return EXIT_OK if result.ok else EXIT_ERROR
 

@@ -66,12 +66,16 @@ class DelegateConfig:
 
     enabled: bool = False
     max_steps: int = 6
+    # 0 means "inherit the top-level max_parallel": a fan-out of sub agents
+    # rarely wants exactly the same width as the parent's tool batch.
+    max_parallel: int = 0
     system: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
             "max_steps": self.max_steps,
+            "max_parallel": self.max_parallel,
             "system": self.system,
         }
 
@@ -180,7 +184,8 @@ def _read_delegate(entry: Any) -> DelegateConfig:
         raise ConfigError(f"unknown [delegate] keys: {', '.join(sorted(unknown))}")
     return DelegateConfig(
         enabled=bool(entry.get("enabled", True)),
-        max_steps=int(entry.get("max_steps") or 6),
+        max_steps=max(1, int(entry.get("max_steps") or 6)),
+        max_parallel=max(0, int(entry.get("max_parallel") or 0)),
         system=entry.get("system"),
     )
 
@@ -235,8 +240,12 @@ def _apply_env(config: Config) -> Config:
             except ValueError as exc:
                 raise ConfigError(f"{ENV_PREFIX}{suffix} must be an integer") from exc
             if suffix == "MAX_STEPS":
+                if value < 1:
+                    raise ConfigError(f"{ENV_PREFIX}{suffix} must be at least 1")
                 config.max_steps = value
             else:
+                if value < 1:
+                    raise ConfigError(f"{ENV_PREFIX}{suffix} must be at least 1")
                 config.max_parallel = value
         elif section == "provider":
             setattr(config.provider, attr, raw)
