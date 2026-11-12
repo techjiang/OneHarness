@@ -24,6 +24,11 @@ class ProviderConfig:
     temperature: float = 0.0
     max_tokens: int | None = None
     timeout: float = 120.0
+    # Bedrock routes on region, not on the URL; Azure routes on a deployment
+    # name in the path. Both are per-provider settings that belong next to the
+    # model rather than in environment variables three layers away.
+    region: str | None = None
+    api_version: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
 
@@ -36,6 +41,8 @@ class ProviderConfig:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "timeout": self.timeout,
+            "region": self.region,
+            "api_version": self.api_version,
             "extra_headers": self.extra_headers or None,
             "extra_body": self.extra_body or None,
         }
@@ -97,6 +104,8 @@ class Config:
                 "base_url": self.provider.base_url,
                 "temperature": self.provider.temperature,
                 "max_tokens": self.provider.max_tokens,
+                "region": self.provider.region,
+                "api_version": self.provider.api_version,
             },
             "system": self.system,
             "max_steps": self.max_steps,

@@ -163,11 +163,13 @@ class AnthropicProvider(Provider):
                 continue
 
             if message.role == "tool":
-                block = {
+                block: dict[str, Any] = {
                     "type": "tool_result",
                     "tool_use_id": message.tool_call_id,
                     "content": message.content,
                 }
+                if message.is_error:
+                    block["is_error"] = True
                 if turns and turns[-1]["role"] == "user" and isinstance(turns[-1]["content"], list):
                     turns[-1]["content"].append(block)
                 else:

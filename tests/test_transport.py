@@ -6,7 +6,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from oneharness.errors import ProviderError
-from oneharness.transport import _read_events, post_json
+from oneharness.transport import _read_events, post_chunks, post_json
 
 
 class FlakyServer:
@@ -130,3 +130,87 @@ class SseParsingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StreamChunkTests(unittest.TestCase):
+    """`post_chunks` must hand bytes over as they arrive, not at the end."""
+
+    def _server(self, pieces, delay=0.05):
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                total = sum(len(piece) for piece in pieces)
+                self.send_response(200)
+                self.send_header("content-type", "application/octet-stream")
+                self.send_header("content-length", str(total))
+                self.end_headers()
+                for piece in pieces:
+                    self.wfile.write(piece)
+                    self.wfile.flush()
+                    time.sleep(delay)
+
+            def log_message(self, *args):
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_port}/stream"
+
+    def test_chunks_arrive_before_the_stream_ends(self):
+        # 3 x 40 bytes at 50ms apart. A buffered read would return all of them
+        # after the last one; streaming means the first arrives while the server
+        # is still working.
+        url = self._server([b"x" * 40] * 3)
+        seen = []
+        for chunk in post_chunks(url, {}):
+            seen.append((len(chunk), time.monotonic()))
+        self.assertEqual(sum(size for size, _ in seen), 120)
+        self.assertGreater(len(seen), 1, "the whole body came back in one read")
+
+    def test_signer_runs_again_on_retry(self):
+        # A signature has a validity window; replaying the one from the first
+        # attempt is how a retry fails for a reason unrelated to the outage.
+        attempts = []
+
+        def signer(url, body, headers):
+            signed = {**headers, "x-attempt": str(len(attempts) + 1)}
+            attempts.append(signed)
+            return signed
+
+        url = self._flaky_then_stream()
+        list(post_chunks(url, {}, sign=signer, retries=1, backoff=0.01))
+        self.assertEqual([attempt["x-attempt"] for attempt in attempts], ["1", "2"])
+
+    def _flaky_then_stream(self):
+        remaining = {"n": 1}
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("content-length", 0)))
+                if remaining["n"]:
+                    remaining["n"] = 0
+                    body = b'{"error":"throttled"}'
+                    self.send_response(429)
+                    self.send_header("content-length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("content-length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_port}/stream"

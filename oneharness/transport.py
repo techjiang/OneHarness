@@ -6,12 +6,20 @@ import json
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from oneharness.errors import ProviderError
 
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
+
+# A signer sees the exact bytes that are about to go on the wire and returns the
+# headers to send with them. It must sign the body it is given, not the payload
+# it came from: re-serialising JSON for signing is how a body ends up signed but
+# not sent (or the reverse), and AWS answers that with a bare
+# `SignatureDoesNotMatch`. It runs again on every retry so a signature is never
+# replayed outside its validity window.
+Signer = Callable[[str, bytes, dict[str, str]], dict[str, str]]
 
 
 def post_json(
@@ -22,6 +30,7 @@ def post_json(
     timeout: float = 120.0,
     retries: int = 2,
     backoff: float = 1.5,
+    sign: Signer | None = None,
 ) -> dict[str, Any]:
     """POST JSON and return the decoded response, retrying transient failures."""
     body = json.dumps(payload).encode("utf-8")
@@ -30,7 +39,8 @@ def post_json(
 
     last_error: ProviderError | None = None
     for attempt in range(retries + 1):
-        request = urllib.request.Request(url, data=body, headers=base_headers, method="POST")
+        headers_to_send = sign(url, body, base_headers) if sign else base_headers
+        request = urllib.request.Request(url, data=body, headers=headers_to_send, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return _decode(response.read())
@@ -72,6 +82,7 @@ def post_sse(
     timeout: float = 120.0,
     retries: int = 2,
     backoff: float = 1.5,
+    sign: Signer | None = None,
 ) -> Iterator[tuple[str | None, dict[str, Any]]]:
     """POST JSON and yield server-sent events as `(event_name, data)` pairs.
 
@@ -84,7 +95,8 @@ def post_sse(
 
     attempt = 0
     while True:
-        request = urllib.request.Request(url, data=body, headers=base_headers, method="POST")
+        headers_to_send = sign(url, body, base_headers) if sign else base_headers
+        request = urllib.request.Request(url, data=body, headers=headers_to_send, method="POST")
         try:
             response = urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
@@ -104,6 +116,63 @@ def post_sse(
             with response:
                 yield from _read_events(response)
             return
+        attempt += 1
+        time.sleep(backoff * (2**attempt))
+
+
+def post_chunks(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    *,
+    accept: str = "application/octet-stream",
+    timeout: float = 120.0,
+    retries: int = 2,
+    backoff: float = 1.5,
+    sign: Signer | None = None,
+) -> Iterator[bytes]:
+    """POST JSON and yield the response body as raw byte chunks.
+
+    Not every stream is SSE. Bedrock answers with a binary event stream, which
+    has no line structure at all, so the transport must be able to hand over
+    bytes and let the format decide how to frame them.
+    """
+    body = json.dumps(payload).encode("utf-8")
+    base_headers = {"content-type": "application/json", "accept": accept}
+    base_headers.update(headers or {})
+
+    attempt = 0
+    while True:
+        headers_to_send = sign(url, body, base_headers) if sign else base_headers
+        request = urllib.request.Request(url, data=body, headers=headers_to_send, method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            text = exc.read().decode("utf-8", "replace")
+            error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
+            if exc.code not in RETRY_STATUS or attempt == retries:
+                raise error from None
+        except urllib.error.URLError as exc:
+            error = ProviderError(f"cannot reach {url}: {exc.reason}")
+            if attempt == retries:
+                raise error from None
+        except TimeoutError:
+            error = ProviderError(f"request to {url} timed out after {timeout}s")
+            if attempt == retries:
+                raise error from None
+        else:
+            with response:
+                # `read(4096)` blocks until the buffer is full or the body ends,
+                # so it would hand a whole stream over at once at the end --
+                # turning every stream into a batch. `read1` returns whatever
+                # has arrived after one system call, which is what streaming
+                # from a socket actually means.
+                reader = getattr(response, "read1", None) or response.read
+                while True:
+                    chunk = reader(4096)
+                    if not chunk:
+                        return
+                    yield chunk
         attempt += 1
         time.sleep(backoff * (2**attempt))
 

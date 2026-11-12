@@ -20,6 +20,7 @@ main:
                 python examples/mcp_demo.py
                 python examples/delegate_demo.py
                 python examples/fanout_demo.py
+                python examples/bedrock_demo.py
 
   pull_request:
     - stages:

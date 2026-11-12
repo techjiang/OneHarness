@@ -17,7 +17,7 @@ from oneharness.config import Config, McpServerConfig, load_config
 from oneharness.delegate import Delegator
 from oneharness.errors import ConfigError, OneHarnessError
 from oneharness.mcp import McpClient, McpError
-from oneharness.providers import PRESETS, create_provider, list_presets
+from oneharness.providers import create_provider, list_presets, preset_defaults
 from oneharness.tools import Registry, Tool
 from oneharness.types import Message
 
@@ -370,10 +370,12 @@ def cmd_tools(_: argparse.Namespace) -> int:
 
 
 def cmd_presets(_: argparse.Namespace) -> int:
-    print(f"{'preset':<12} {'default model':<32} base_url")
+    print(f"{'preset':<12} {'default model':<44} base_url")
     for name in list_presets():
-        spec = PRESETS[name]
-        print(f"{name:<12} {spec['default_model']:<32} {spec['base_url']}")
+        defaults = preset_defaults(name)
+        model = defaults["default_model"] or "(deployment name required)"
+        base_url = defaults["base_url"] or "(set AZURE_OPENAI_ENDPOINT)"
+        print(f"{name:<12} {model:<44} {base_url}")
     return EXIT_OK
 
 

@@ -69,6 +69,10 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
+    # A failed tool call is still a message to the model, but Anthropic and
+    # Bedrock both distinguish "here is output" from "this went wrong" on the
+    # wire. OpenAI does not, so it simply ignores this flag.
+    is_error: bool = False
 
     @classmethod
     def system(cls, content: str) -> Message:
@@ -83,8 +87,20 @@ class Message:
         return cls(role="assistant", content=content, tool_calls=list(tool_calls or ()))
 
     @classmethod
-    def tool(cls, tool_call_id: str, content: str, name: str | None = None) -> Message:
-        return cls(role="tool", content=content, tool_call_id=tool_call_id, name=name)
+    def tool(
+        cls,
+        tool_call_id: str,
+        content: str,
+        name: str | None = None,
+        is_error: bool = False,
+    ) -> Message:
+        return cls(
+            role="tool",
+            content=content,
+            tool_call_id=tool_call_id,
+            name=name,
+            is_error=is_error,
+        )
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"role": self.role, "content": self.content}
@@ -168,7 +184,7 @@ class ToolResult:
     is_error: bool = False
 
     def as_message(self) -> Message:
-        return Message.tool(self.tool_call_id, self.content, self.name)
+        return Message.tool(self.tool_call_id, self.content, self.name, self.is_error)
 
     def as_dict(self) -> dict[str, Any]:
         return {

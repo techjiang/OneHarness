@@ -9,7 +9,7 @@ from oneharness.providers import create_provider, list_presets
 from oneharness.tools import Registry, Tool, tool
 from oneharness.types import Completion, Message, StreamEvent, ToolCall, ToolResult, Usage
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Agent",

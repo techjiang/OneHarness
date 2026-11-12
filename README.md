@@ -4,9 +4,10 @@
 
 不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做五件事：
 
-1. 把 OpenAI / Anthropic / Gemini 三种线格式抹平成同一个 `Completion`；
+1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
+   包括 Bedrock 的请求签名和二进制流；
 2. 跑「模型要调工具 → 执行 → 结果回灌 → 再问」这个循环，且不让工具的错误炸掉循环；
-3. 支持流式输出，并且能在工具调用跨多个 chunk 时把它拼回来；
+3. 支持流式输出，并且能在工具调用跨多个 chunk（或跨多个二进制帧）时把它拼回来；
 4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent ——
    包括一次派出去好几个；
 5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具。
@@ -257,6 +258,57 @@ $ oneharness run "把三条命令都跑一遍" --shell --parallel 3
 前者是给看日志的人，后者是给模型的可预测性。单个工具失败仍然只影响自己那一格，
 不影响同批的其他工具，也不炸循环。
 
+## Bedrock
+
+Bedrock 是三种线格式之外的第一种「麻烦不在线格式」的 provider。两件事跟别人都不一样：
+
+**每个请求都要签名，而签名覆盖的是真正发出去的字节。** 用 `payload` 重新序列化一遍去签、
+发的时候再序列化一遍，两份 JSON 只要差一个空格就是 `SignatureDoesNotMatch`，
+而 AWS 不会告诉你是哪一字节错了。所以签名的输入是 `transport` 手里那份 `bytes`，
+并且每次重试都重签——签名里带着时间戳，AWS 只接受时间窗内的它；
+把第一次失败的签名原样重放，第二次失败的原因就跟这次网络抖动无关了。
+
+**流不是 SSE，是二进制帧。** `application/vnd.amazon.eventstream` 每帧自带长度和两个
+CRC32（一个盖住 prelude，一个盖住整帧）。所以它没法按行切，而且必须先校验「长度这个数字
+本身」再去读那么多字节——prelude 的 CRC 就是为这件事存在的。
+
+签名和帧编解码各自是一个模块（`sigv4.py` / `eventstream.py`），都能脱离 Bedrock 单独测：
+
+- `sigv4.py` 对 AWS 官方文档里的测试向量逐字节吻合：S3 的 GET object、GET bucket lifecycle，
+  通用服务的空 POST、query 参数排序，以及签名密钥的推导
+- Bedrock 的假服务器**从它真正收到的字节重算签名**再比对——这是不接真 AWS 能做的最强检查：
+  签的和发的只要不是同一份序列化结果，这个测试就红
+- `eventstream.py` 用手工按布局拼的帧校准（不是用被测的那个编码器生成的），写的时候还用
+  `botocore` 的 `EventStreamBuffer` 交叉解过一遍——自己编码自己解码不算验证，
+  同一个误解会同时骗过两遍。`botocore` 没进依赖，也没进测试：只用来校对一次那串测试字节
+
+```console
+$ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-west-2
+$ oneharness run "看看 app.conf" --provider bedrock --model anthropic.claude-3-5-sonnet-20241022-v2:0
+$ oneharness run "看看 app.conf" --provider bedrock --stream
+```
+
+模型 id 会进 URL 路径，所以要 percent-encode：cross-region inference profile 的 id 是
+`arn:aws:bedrock:...` 这种形状，冒号原样留在被签名的路径里就是签名不匹配。
+
+凭证只认标准环境变量（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`），
+**没有**实现 profile、实例角色、SSO 那条完整链。那是一条很长的代码和一堆启动时缓慢失败的方式，
+而 CI 和容器用的就是环境变量。
+
+## Azure OpenAI
+
+线格式是 OpenAI 的，差异全在「怎么找到它」：端点里嵌的是**部署名**而不是模型名，
+`api-version` 是个必填的 query 参数，鉴权头是 `api-key` 而不是 `Bearer`。
+三条都是一行代码的差别，搞错了就是一个 404 或 401。
+
+```console
+$ export AZURE_OPENAI_API_KEY=... AZURE_OPENAI_ENDPOINT=https://my-res.openai.azure.com
+$ oneharness run "ping" --provider azure --model my-deployment
+```
+
+`--model` 传的是部署名，`--provider azure` 的 `base_url` 省略时读 `AZURE_OPENAI_ENDPOINT`。
+两个都缺的时候报错会直接告诉你缺哪个，而不是在发请求时报 400。
+
 ## 配置
 
 
@@ -286,7 +338,17 @@ max_parallel = 4             # 同时跑几个子 agent；省略则跟随 [agent
 API Key 走各 provider 的常规变量名：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、
 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、
 `DASHSCOPE_API_KEY`、`ZHIPU_API_KEY`、`GROQ_API_KEY`、`MISTRAL_API_KEY`、
-`OPENROUTER_API_KEY`；`ollama` 不需要。
+`OPENROUTER_API_KEY`、`AZURE_OPENAI_API_KEY`；`ollama` 不需要。
+`bedrock` 用 `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION`。
+
+`region` 和 `api_version` 也能写在 `[provider]` 里，跟着模型走而不是散在环境变量里：
+
+```toml
+[provider]
+preset = "bedrock"
+model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+region = "eu-central-1"
+```
 
 配 `base_url` 就能接任何 OpenAI 兼容服务（vLLM、llama.cpp、LM Studio、one-api 中转）：
 
@@ -323,6 +385,11 @@ model = "Qwen2.5-72B-Instruct"
 **没有内置重试模型决策。** provider 层的 429/5xx 会自动退避重试（`transport.py`），
 但「模型答得不对要不要重问」属于业务判断，交给调用方。
 
+**流式靠 `read1`，不靠 `read`。** `HTTPResponse.read(4096)` 会一直阻塞到攒满 4096 字节或
+读到 EOF，于是整个流在最后一次性交出来——它不报错，只是把流式悄悄变成批处理。
+`read1` 才是「有多少给多少」。SSE 路径没暴露过这个问题，因为按行迭代本来就是逐行阻塞的；
+二进制帧路径把它暴露了。
+
 **没有 asyncio。** 流式不需要 event loop——SSE 是按行迭代的生成器。并发只用在唯一真正值得
 并发的地方：同一轮里的多个工具调用，用线程池，且要显式 `--parallel N` 才开。provider 请求
 永远串行，因为一个 agent 的下一步依赖上一步。
@@ -335,8 +402,10 @@ model = "Qwen2.5-72B-Instruct"
 ```
 oneharness/
   types.py        Message / ToolCall / Completion / Usage / ToolResult / StreamEvent
-  transport.py    urllib 封装：JSON POST + SSE，带 429/5xx 退避重试
-  providers/      base.py + openai.py + anthropic.py + gemini.py
+  sigv4.py        AWS Signature V4：一个纯函数，两处签名（请求 + 每次重试）
+  eventstream.py  vnd.amazon.eventstream 二进制帧编解码，两个 CRC 都校验
+  transport.py    urllib 封装：JSON POST + SSE + 裸字节流，带 429/5xx 退避重试
+  providers/      base.py + openai.py + anthropic.py + gemini.py + bedrock.py + azure.py
   tools.py        @tool 装饰器、schema 生成、Registry
   agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
@@ -344,8 +413,8 @@ oneharness/
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / config
-tests/            161 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
-examples/         五个离线 demo：e2e / stream / mcp / delegate / fanout，都不需要 API Key
+tests/            205 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
+examples/         六个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock，都不需要 API Key
 ```
 
 ## 开发
@@ -357,6 +426,7 @@ $ python examples/stream_demo.py             # 流式 + 跨 chunk 的工具调�
 $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
 $ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
 $ python examples/fanout_demo.py             # 一次派三个子 agent，逐个 vs 同时
+$ python examples/bedrock_demo.py           # 签名回验 + 二进制帧流，本地假 Bedrock
 $ ruff check oneharness tests examples   # 风格（不格式 Markdown 里的示例）
 ```
 
