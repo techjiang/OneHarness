@@ -7,7 +7,8 @@
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
 2. 跑「模型要调工具 → 执行 → 结果回灌 → 再问」这个循环，且不让工具的错误炸掉循环；
-3. 支持流式输出，并且能在工具调用跨多个 chunk（或跨多个二进制帧）时把它拼回来；
+3. 支持流式输出：token 边生成边出，工具调用在**参数还在到达时**就可见，连接断了也留住
+   已经收到的半句；
 4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent ——
    包括一次派出去好几个；
 5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具；
@@ -120,11 +121,16 @@ $ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重�
 `--json` 也照常可用（`--json` 与 `--stream` 同时给时以 JSON 为准）。
 
 ```console
-$ oneharness run "分析下 app.conf" --stream
-Let me check the config file.
-  → read_file({"path": "app.conf"})
-  ✓ read_file: timeout=5
-Found it. timeout was 5 seconds, which is far too short for a real request.
+$ oneharness run "把两个配置文件都改一下" --stream
+  … write_file#0({"path":…
+  … write_file#1(…
+  … write_file#0( "a.conf",…
+  … write_file#1({"path":…
+  … write_file#0( "content": "timeout=30\n"}…
+  … write_file#1( "b.conf", "content": "retries=3\n"}…
+  ✓ write_file: wrote 11 chars to a.conf
+  ✓ write_file: wrote 10 chars to b.conf
+Two files to fix. Both written. a.conf gets timeout=30, b.conf gets retries=3.
 ```
 
 三个 provider 都实现了真正的 SSE 解析。细节上各有各的坑，都收在 provider 里：
@@ -135,6 +141,49 @@ Found it. timeout was 5 seconds, which is far too short for a real request.
 - Gemini 走 `streamGenerateContent?alt=sse`，函数调用以完整对象出现，不需要拼。
 
 如果某个 provider 没实现 `stream()`，基类会退化成「一次性发完」，`--stream` 依然能用。
+
+### 工具调用在写完之前就露面
+
+上面的 `… write_file#0(...)` 是**参数还在到达时**就画出来的那一行，不是等工具跑完才补的。
+`#N` 是 provider 自己的 `index`：同一轮里两个调用会交错着拼参数，行首的编号是唯一能分辨
+「这个逗号属于谁」的东西。
+
+以前做不到这件事：完整参数只存在于 `done` 事件里，于是「有个 `write_file` 要来了」这条信息
+总是在模型把两 KB 正文写完**之后**才出现——正好是它失去价值的那一刻。现在 `StreamEvent`
+多了一种 `tool`（`text` / `tool` / `done`），CLI 相应多一个 `tool_call_delta` 事件：
+
+```json
+{"type": "tool_call_delta", "step": 1, "index": 0, "id": "call_a", "name": "write_file", "fragment": "{\"path\":"}
+```
+
+`fragment` 为空表示「这个调用存在，参数还没有」。把同 `index` 的 `fragment` 依次接起来
+就是最终的参数 JSON——所以它既是给人看的进度，也是一份能自己拼的增量流。
+
+三个适配器各有各的时机，因为各家的帧结构不同：OpenAI 的名和参数挤在同一个 `tool_calls`
+delta 里，Anthropic 在 `content_block_start` 就给了 id 和 name（参数一个字节都还没有），
+Gemini 则是一个完整对象、没有增量可言。
+
+### 流断了，半句话还在
+
+连接中途断掉（超时、代理掐了、服务器崩了）时，已经收到的文本不会被丢掉：
+
+```console
+$ oneharness run "..." --stream
+  ! stream ended without a final completion -- kept 38 chars it had already said
+Two files to fix. Both written. a.conf gets timeout=30,
+[the answer above is incomplete]
+```
+
+`stopped_reason="interrupted"`，`--json` 里多一个 `interrupted` 字段写原因，退出码 1。
+Ctrl-C 同理，只是原因写作 `interrupted by user (Ctrl-C)`、退出码 130——和 shell 对 Ctrl-C
+的约定一致，`oneharness run ... && ...` 才不会把「人主动停了」当成成功。
+
+这条不对称是刻意的：**非流式没有半句话可言**，body 没解析出来就是没有，仍然抛异常。
+流式之所以能留住，是因为那些字节已经真的到了。
+
+判断「断了」的依据是 provider 自己的收尾标记，不是「读完了」：OpenAI 的 `finish_reason`、
+Anthropic 的 `stop_reason`、Bedrock 的 `messageStop`、Gemini 的 `finishReason`。少一个都算截断——
+适配器不再替服务器编一个「正常结束」，因为它不知道那是不是正常结束。
 
 ## MCP
 
@@ -537,7 +586,11 @@ model = "Qwen2.5-72B-Instruct"
 永远串行，因为一个 agent 的下一步依赖上一步。
 
 **流式不改变结果形状。** token 通过 `on_event` 走旁路，agent 循环仍然只处理「已完成的一轮」。
-这样工具调用在中途出现时，行为和一次性返回时一模一样，不需要两套循环。
+工具调用的增量也只是事件，不参与决策：`done` 里的那份完整参数仍是唯一被执行的版本。
+这样行为只有一套，`--json` 也照旧。
+
+**截断和中断不是失败，但要如实说。** 流断了就返回 `stopped_reason="interrupted"`，退出码 1；
+Ctrl-C 退出码 130。把半句话当成完整答案是一种撒谎，把已经到达的半句话丢掉则是另一种。
 
 ## 项目结构
 
@@ -558,9 +611,9 @@ oneharness/
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config
-tests/            273 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
-examples/         八个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor / context，
-                  都不需要 API Key
+tests/            289 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
+examples/         九个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools，都不需要 API Key
 ```
 
 ## 开发
@@ -575,6 +628,7 @@ $ python examples/fanout_demo.py             # 一次派三个子 agent，逐个
 $ python examples/bedrock_demo.py            # 签名回验 + 二进制帧流，本地假 Bedrock
 $ python examples/doctor_demo.py             # 真端点录下的 tape 上跑 doctor + record/replay 闭环
 $ python examples/context_demo.py            # 40KB 工具结果：先裁 / 被拒后重试 / 没得裁就停
+$ python examples/stream_tools_demo.py       # 工具调用在参数写完前露面；流断了半句话还在
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```
 

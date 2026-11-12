@@ -9,15 +9,25 @@ from oneharness.mcp import McpClient, connect_mcp
 from oneharness.providers import create_provider, list_presets
 from oneharness.tape import Tape, TapeError
 from oneharness.tools import Registry, Tool, tool
-from oneharness.types import Completion, Message, StreamEvent, ToolCall, ToolResult, Usage
+from oneharness.types import (
+    INTERRUPTED_BY_USER,
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolResult,
+    Usage,
+)
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 __all__ = [
     "Agent",
     "AgentResult",
     "Completion",
     "ConfigError",
+    "INTERRUPTED_BY_USER",
     "DelegationError",
     "Delegator",
     "McpClient",
@@ -26,6 +36,7 @@ __all__ = [
     "Probe",
     "ProviderError",
     "Registry",
+    "STREAM_ENDED_EARLY",
     "StreamEvent",
     "Tape",
     "TapeError",

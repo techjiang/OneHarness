@@ -8,6 +8,12 @@ from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant", "tool"]
 
+# Why a completion is incomplete. Both live here rather than in `agent` because
+# the providers have to set them: only the adapter knows whether the stream it
+# was reading ever reached its terminal marker.
+INTERRUPTED_BY_USER = "interrupted by user (Ctrl-C)"
+STREAM_ENDED_EARLY = "stream ended without a final completion"
+
 
 @dataclass(slots=True)
 class ToolCall:
@@ -152,6 +158,9 @@ class Completion:
     model: str | None = None
     stop_reason: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    # Set when the stream ended before the provider said it was done. The text
+    # is whatever had already been produced, which is worth more than nothing.
+    truncated: str | None = None
 
     @property
     def text(self) -> str:
@@ -169,11 +178,20 @@ class StreamEvent:
     Providers yield `text` events as tokens arrive and exactly one `done`
     event carrying the assembled Completion, so the agent loop has a single
     place to pick the finished turn up from.
+
+    `tool` events are the third kind: a tool call as it is being *assembled*.
+    The id and name arrive once, then each `fragment` is the next slice of the
+    argument JSON. Nobody has to wait for the closing brace to know a tool is
+    about to run -- which is what a person watching a long `write_file` wants
+    to see, and what the `done` event alone cannot tell them.
     """
 
-    kind: Literal["text", "done"]
+    kind: Literal["text", "tool", "done"]
     text: str = ""
     completion: Completion | None = None
+    call: ToolCall | None = None
+    fragment: str = ""
+    index: int = 0
 
 
 @dataclass(slots=True)

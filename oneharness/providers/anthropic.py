@@ -8,7 +8,14 @@ from typing import Any
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.transport import post_json, post_sse
-from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
+from oneharness.types import (
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    Usage,
+)
 
 
 class AnthropicProvider(Provider):
@@ -74,6 +81,17 @@ class AnthropicProvider(Provider):
                 blocks[index] = block
                 if block.get("type") == "tool_use":
                     partial_json[index] = []
+                    # The id and the name arrive here, before any argument
+                    # exists: announce it now, so a watcher knows a tool is
+                    # coming while the model is still writing its input.
+                    yield StreamEvent(
+                        kind="tool",
+                        index=index,
+                        call=ToolCall(
+                            id=block.get("id") or f"call_{index}",
+                            name=block.get("name") or "",
+                        ),
+                    )
             elif kind == "content_block_delta":
                 index = int(chunk.get("index", 0))
                 delta = chunk.get("delta") or {}
@@ -83,7 +101,18 @@ class AnthropicProvider(Provider):
                         text.append(piece)
                         yield StreamEvent(kind="text", text=piece)
                 elif delta.get("type") == "input_json_delta":
-                    partial_json.setdefault(index, []).append(delta.get("partial_json") or "")
+                    fragment = delta.get("partial_json") or ""
+                    partial_json.setdefault(index, []).append(fragment)
+                    if fragment:
+                        yield StreamEvent(
+                            kind="tool",
+                            index=index,
+                            fragment=fragment,
+                            call=ToolCall(
+                                id=(blocks.get(index) or {}).get("id") or f"call_{index}",
+                                name=(blocks.get(index) or {}).get("name") or "",
+                            ),
+                        )
             elif kind == "message_delta":
                 stop_reason = (chunk.get("delta") or {}).get("stop_reason") or stop_reason
                 raw_usage = chunk.get("usage") or {}
@@ -114,6 +143,10 @@ class AnthropicProvider(Provider):
                 model=model,
                 stop_reason=stop_reason,
                 raw={"streamed": True},
+                # `stop_reason` rides in `message_delta`; if it never came, the
+                # body was cut after `content_block_delta` and the text is real
+                # but unfinished.
+                truncated=None if stop_reason else STREAM_ENDED_EARLY,
             ),
         )
 

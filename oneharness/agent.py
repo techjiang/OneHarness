@@ -12,8 +12,19 @@ from oneharness import context as context_module
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.tools import Registry
-from oneharness.types import Completion, Message, ToolCall, ToolResult, Usage
+from oneharness.types import (
+    INTERRUPTED_BY_USER,
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolResult,
+    Usage,
+)
 
+# The one interruption that is a human decision rather than a failure; the CLI
+# maps it back to 130 so a shell still sees "the user stopped this".
 Observer = Callable[[dict[str, Any]], None]
 
 
@@ -43,15 +54,24 @@ class AgentResult:
     messages: list[Message]
     steps: list[Step]
     usage: Usage
-    stopped_reason: str  # "done" | "max_steps"
+    stopped_reason: str  # "done" | "max_steps" | "interrupted"
     model: str | None = None
     # What the budget cut on the way to the last request. Present only when
     # something actually had to go, so a run that fitted looks as it always did.
     trim: dict[str, int] | None = None
+    # Why the stream stopped early, when it did. The partial answer in `text`
+    # is what the model had already said out loud; throwing it away because the
+    # connection died would discard the only thing that arrived.
+    interrupted: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.stopped_reason == "done"
+
+    @property
+    def interrupted_by_user(self) -> bool:
+        """True when a human stopped the run, which is not a failure."""
+        return self.interrupted == INTERRUPTED_BY_USER
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -65,6 +85,8 @@ class AgentResult:
         # mistake for a broken run than a missing key.
         if self.trim is not None:
             data["trim"] = self.trim
+        if self.interrupted:
+            data["interrupted"] = self.interrupted
         return data
 
 
@@ -122,6 +144,7 @@ class Agent:
         stopped = "max_steps"
         final_text = ""
         trim: context_module.Trim | None = None
+        interrupted: str | None = None
 
         for index in range(self.max_steps):
             started = time.monotonic()
@@ -148,7 +171,37 @@ class Agent:
             if completion.text:
                 final_text = completion.text
 
+            if completion.truncated:
+                # A half-answer is not a turn: it has no tool calls to run and
+                # no promise of being finished, so the loop stops here and says
+                # why rather than pretending the model chose to end.
+                interrupted = completion.truncated
+                stopped = "interrupted"
+                step.seconds = time.monotonic() - started
+                self._emit(
+                    {
+                        "type": "interrupted",
+                        "step": index + 1,
+                        "reason": interrupted,
+                        "chars": len(completion.text),
+                    }
+                )
+                break
+
             if not completion.tool_calls:
+                # The step that answers is the one people want the duration of,
+                # and it used to be the only one still reporting 0.0 -- the
+                # number was set after the tool loop, which a final step never
+                # reaches.
+                step.seconds = time.monotonic() - started
+                self._emit(
+                    {
+                        "type": "step_end",
+                        "step": index + 1,
+                        "seconds": round(step.seconds, 3),
+                        "tool_calls": 0,
+                    }
+                )
                 stopped = "done"
                 break
 
@@ -177,6 +230,7 @@ class Agent:
             stopped_reason=stopped,
             model=getattr(self.provider, "model", None),
             trim=trim.as_dict() if trim is not None and trim.changed else None,
+            interrupted=interrupted,
         )
 
     def _run_tools(self, calls: Sequence[ToolCall], *, step_index: int) -> list[ToolResult]:
@@ -188,7 +242,14 @@ class Agent:
         racing on the same path is a real hazard, and the caller knows better.
         """
         for call in calls:
-            self._emit({"type": "tool_start", "name": call.name, "arguments": call.arguments})
+            self._emit(
+                {
+                    "type": "tool_start",
+                    "name": call.name,
+                    "id": call.id,
+                    "arguments": call.arguments,
+                }
+            )
 
         if self.max_parallel == 1 or len(calls) == 1:
             results = []
@@ -302,17 +363,67 @@ class Agent:
 
         text: list[str] = []
         finished: Completion | None = None
-        for event in self.provider.stream(messages, specs):
-            if event.kind == "text":
-                text.append(event.text)
-                self._emit({"type": "text_delta", "step": step, "text": event.text})
-            elif event.completion is not None:
-                finished = event.completion
+        events = self.provider.stream(messages, specs)
+        try:
+            for event in events:
+                if event.kind == "text":
+                    text.append(event.text)
+                    self._emit({"type": "text_delta", "step": step, "text": event.text})
+                elif event.kind == "tool":
+                    self._emit_tool_call(event, step)
+                elif event.completion is not None:
+                    finished = event.completion
+        except KeyboardInterrupt:
+            # Ctrl-C is a decision, not a crash. Whatever the model already
+            # said out loud goes into the result instead of being thrown away
+            # together with the connection.
+            finished = self._truncated("".join(text), INTERRUPTED_BY_USER)
+        except ProviderError as exc:
+            if not text:
+                raise
+            # A connection that dies halfway is the same situation: half an
+            # answer that arrived beats an exception that hides it.
+            finished = self._truncated("".join(text), f"stream failed: {exc}")
+        finally:
+            close = getattr(events, "close", None)
+            if close is not None:
+                close()  # stop reading the body; nothing should keep draining it
         if finished is None:
-            raise ProviderError("stream ended without a final completion")
+            if not text:
+                raise ProviderError("stream ended without a final completion")
+            # The body simply stopped: no `done`, no finish reason. That is the
+            # same situation as a reset connection, and the text that arrived is
+            # just as worth keeping -- this is exactly the case that used to
+            # throw away a half-written answer because the JSON was incomplete.
+            finished = self._truncated("".join(text), STREAM_ENDED_EARLY)
         if not finished.message.content and text:
             finished.message = Message.assistant("".join(text), finished.message.tool_calls)
         return finished
+
+    @staticmethod
+    def _truncated(text: str, reason: str) -> Completion:
+        """A completion that ended early, keeping the text that did arrive."""
+        return Completion(message=Message.assistant(text), truncated=reason)
+
+    def _emit_tool_call(self, event: StreamEvent, step: int) -> None:
+        """Announce a tool call while it is still being assembled.
+
+        `fragment` empty means "the call exists, its arguments do not yet"; each
+        later fragment is the next slice of the argument JSON. A watcher learns
+        that a `write_file` is coming before the whole body has been generated,
+        which is the only moment when knowing it is still worth anything.
+        """
+        call = event.call
+        self._emit(
+            {
+                "type": "tool_call_delta",
+                "step": step,
+                "index": event.index,
+                "id": call.id if call is not None else "",
+                "name": call.name if call is not None else "",
+                "fragment": event.fragment,
+            }
+        )
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self.on_event is not None:

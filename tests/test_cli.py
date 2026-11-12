@@ -130,6 +130,69 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.count("pong"), 1)
 
+    def test_streamed_tool_call_line_is_not_printed_twice(self):
+        class ToolStreamingProvider:
+            name = "fake"
+            model = "fake-1"
+
+            def __init__(self):
+                self.rounds = 0
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("stream mode must not call complete()")
+
+            def stream(self, messages, tools=None):
+                from oneharness.types import StreamEvent
+
+                self.rounds += 1
+                if self.rounds == 1:
+                    call = ToolCall.from_raw(call_id="c1", name="list_dir", arguments={"path": "."})
+                    yield StreamEvent(kind="tool", index=0, call=ToolCall(id="c1", name="list_dir"))
+                    yield StreamEvent(
+                        kind="tool",
+                        index=0,
+                        call=ToolCall(id="c1", name="list_dir"),
+                        fragment='{"path": "."}',
+                    )
+                    yield StreamEvent(
+                        kind="done",
+                        completion=Completion(message=Message.assistant("", [call])),
+                    )
+                else:
+                    yield StreamEvent(
+                        kind="done", completion=Completion(message=Message.assistant("ok"))
+                    )
+
+        with mock.patch.object(cli, "create_provider", return_value=ToolStreamingProvider()):
+            code, out, err = run_cli(["run", "ping", "--stream", "--workspace", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "ok")
+        # the growing line already showed the arguments; a second copy is noise
+        self.assertEqual(err.count("list_dir"), 2, err)  # announcement + result line
+        self.assertIn('… list_dir#0({"path": "."}…', err)
+        self.assertNotIn("→ list_dir(", err)
+
+    def test_interrupted_run_exits_130(self):
+        class InterruptingProvider:
+            name = "fake"
+            model = "fake-1"
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("stream mode must not call complete()")
+
+            def stream(self, messages, tools=None):
+                from oneharness.types import StreamEvent
+
+                yield StreamEvent(kind="text", text="half a thought")
+                raise KeyboardInterrupt
+
+        with mock.patch.object(cli, "create_provider", return_value=InterruptingProvider()):
+            code, out, err = run_cli(["run", "ping", "--stream", "--workspace", str(self.root)])
+        # Ctrl-C is 130 to a shell, and stdout still carries the partial answer
+        self.assertEqual(code, 130)
+        self.assertIn("half a thought", out)
+        self.assertIn("incomplete", err)
+
     def test_mcp_server_receives_tools(self):
         from tests.test_mcp import SERVER
 

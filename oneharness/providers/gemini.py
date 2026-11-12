@@ -14,7 +14,15 @@ from typing import Any
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.transport import post_json, post_sse
-from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
+from oneharness.types import (
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    Usage,
+    dumps,
+)
 
 
 class GeminiProvider(Provider):
@@ -84,6 +92,20 @@ class GeminiProvider(Provider):
                         yield StreamEvent(kind="text", text=piece)
                 elif "functionCall" in part:
                     parts.append(part)
+                    call = part["functionCall"] or {}
+                    # Gemini sends a function call as one whole object, so there
+                    # is nothing to stitch -- the announcement is the call, and
+                    # the fragment is its complete argument JSON.
+                    yield StreamEvent(
+                        kind="tool",
+                        index=len(parts) - 1,
+                        fragment=dumps(call.get("args") or {}),
+                        call=ToolCall.from_raw(
+                            call_id=f"call_{len(parts) - 1}",
+                            name=call.get("name") or "",
+                            arguments=call.get("args") or {},
+                        ),
+                    )
 
         calls = [
             ToolCall.from_raw(
@@ -101,6 +123,9 @@ class GeminiProvider(Provider):
                 model=model,
                 stop_reason=stop_reason,
                 raw={"streamed": True},
+                # Gemini puts `finishReason` on the last candidate chunk; no
+                # reason means the stream stopped before it finished.
+                truncated=None if stop_reason else STREAM_ENDED_EARLY,
             ),
         )
 

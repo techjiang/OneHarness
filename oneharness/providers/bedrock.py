@@ -24,7 +24,14 @@ from oneharness.eventstream import decode_frames
 from oneharness.providers.base import Provider
 from oneharness.sigv4 import Credentials, sign_request
 from oneharness.transport import Signer, post_chunks, post_json
-from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
+from oneharness.types import (
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    Usage,
+)
 
 SERVICE = "bedrock"
 DEFAULT_REGION = "us-east-1"
@@ -101,6 +108,11 @@ class BedrockProvider(Provider):
                     "name": start.get("name") or "",
                     "arguments": "",
                 }
+                yield StreamEvent(
+                    kind="tool",
+                    index=index,
+                    call=ToolCall(id=calls[index]["id"], name=calls[index]["name"]),
+                )
             elif event == "contentBlockDelta":
                 delta = body.get("delta") or {}
                 if "text" in delta:
@@ -111,7 +123,15 @@ class BedrockProvider(Provider):
                 elif "toolUse" in delta:
                     index = int(body.get("contentBlockIndex", 0))
                     slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
-                    slot["arguments"] += (delta.get("toolUse") or {}).get("input") or ""
+                    fragment = (delta.get("toolUse") or {}).get("input") or ""
+                    slot["arguments"] += fragment
+                    if fragment:
+                        yield StreamEvent(
+                            kind="tool",
+                            index=index,
+                            fragment=fragment,
+                            call=ToolCall(id=slot["id"] or f"tool_{index}", name=slot["name"]),
+                        )
             elif event == "messageStop":
                 stop_reason = body.get("stopReason") or stop_reason
             elif event == "metadata":
@@ -134,6 +154,9 @@ class BedrockProvider(Provider):
                 model=model,
                 stop_reason=stop_reason,
                 raw={"streamed": True},
+                # `messageStop` is the last frame of a complete turn; without it
+                # the event stream ended mid-sentence.
+                truncated=None if stop_reason else STREAM_ENDED_EARLY,
             ),
         )
 

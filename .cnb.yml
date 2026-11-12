@@ -23,6 +23,7 @@ main:
                 python examples/bedrock_demo.py
                 python examples/doctor_demo.py
                 python examples/context_demo.py
+                python examples/stream_tools_demo.py
 
   pull_request:
     - stages:
@@ -46,3 +47,4 @@ main:
                 python examples/bedrock_demo.py
                 python examples/doctor_demo.py
                 python examples/context_demo.py
+                python examples/stream_tools_demo.py

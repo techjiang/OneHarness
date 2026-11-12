@@ -149,10 +149,14 @@ class AgentLoopTests(unittest.TestCase):
                 "step_end",
                 "step_start",
                 "assistant",
+                # The answering step is timed too: it used to be the only one
+                # reporting 0.0, which is a duration nobody should trust.
+                "step_end",
             ],
         )
         self.assertEqual(events[2]["name"], "add")
         self.assertEqual(events[4]["tool_calls"], 1)
+        self.assertEqual(events[7]["tool_calls"], 0)
 
     def test_stream_mode_emits_deltas_and_keeps_result_shape(self):
         class StreamingProvider(Provider):
@@ -189,7 +193,10 @@ class AgentLoopTests(unittest.TestCase):
         deltas = [e["text"] for e in events if e["type"] == "text_delta"]
         self.assertEqual("".join(deltas), "let me addit is 5")
 
-    def test_stream_mode_reports_missing_completion(self):
+    def test_stream_that_just_stops_keeps_its_text(self):
+        # No `done`, no finish reason: the body simply ended. The text that did
+        # arrive is kept and the run is marked truncated -- raising here would
+        # discard the only thing that came back.
         class Mute(Provider):
             name = "mute"
 
@@ -199,8 +206,24 @@ class AgentLoopTests(unittest.TestCase):
             def stream(self, messages, tools=None):
                 yield StreamEvent(kind="text", text="half")
 
+        result = Agent(Mute("m")).run("hi", stream=True)
+        self.assertEqual(result.text, "half")
+        self.assertEqual(result.stopped_reason, "interrupted")
+        self.assertIn("without a final completion", result.interrupted)
+
+    def test_stream_that_produces_nothing_still_raises(self):
+        class Silent(Provider):
+            name = "silent"
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("unused")
+
+            def stream(self, messages, tools=None):
+                return
+                yield  # pragma: no cover - makes this a generator
+
         with self.assertRaises(ProviderError):
-            Agent(Mute("m")).run("hi", stream=True)
+            Agent(Silent("m")).run("hi", stream=True)
 
     def test_default_stream_falls_back_to_complete(self):
         """A provider without real streaming still works under --stream."""
@@ -284,7 +307,111 @@ class AgentLoopTests(unittest.TestCase):
         provider = ScriptedProvider(tool_reply("add", '{"a": 1, "b": 2}'), text_reply("3"))
         result = Agent(provider, [add]).run("go")
         self.assertGreaterEqual(result.steps[0].seconds, 0.0)
+        self.assertGreaterEqual(result.steps[1].seconds, 0.0)
         self.assertIn("seconds", result.as_dict()["steps"][0])
+
+    def test_tool_call_deltas_reach_the_observer_before_the_tool_runs(self):
+        class StreamingTools(Provider):
+            name = "streamy"
+
+            def __init__(self):
+                super().__init__(model="m")
+                self.rounds = 0
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("stream mode must not call complete()")
+
+            def stream(self, messages, tools=None):
+                self.rounds += 1
+                if self.rounds == 1:
+                    yield StreamEvent(kind="tool", index=0, call=ToolCall(id="c1", name="add"))
+                    yield StreamEvent(
+                        kind="tool",
+                        index=0,
+                        call=ToolCall(id="c1", name="add"),
+                        fragment='{"a": 1, "b": 2}',
+                    )
+                    yield StreamEvent(kind="done", completion=tool_reply("add", {"a": 1, "b": 2}))
+                else:
+                    yield StreamEvent(kind="text", text="2")
+                    yield StreamEvent(kind="done", completion=text_reply("2"))
+
+        events = []
+        Agent(StreamingTools(), [add], on_event=events.append).run("go", stream=True)
+        kinds = [e["type"] for e in events]
+        # the announcement lands before the tool is started, which is the whole
+        # point: a watcher learns what is about to run while it is being written
+        self.assertLess(kinds.index("tool_call_delta"), kinds.index("tool_start"))
+        announced = [e for e in events if e["type"] == "tool_call_delta"]
+        self.assertEqual(announced[0]["name"], "add")
+        self.assertEqual(announced[0]["fragment"], "")
+        self.assertEqual(announced[1]["fragment"], '{"a": 1, "b": 2}')
+
+    def test_mid_stream_failure_keeps_the_text_that_arrived(self):
+        from oneharness.errors import ProviderError
+
+        class DyingStream(Provider):
+            name = "dying"
+
+            def __init__(self):
+                super().__init__(model="m")
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("must not be called")
+
+            def stream(self, messages, tools=None):
+                yield StreamEvent(kind="text", text="The timeout is ")
+                yield StreamEvent(kind="text", text="five seconds")
+                raise ProviderError("connection reset by peer")
+
+        result = Agent(DyingStream()).run("go", stream=True)
+        # half an answer that arrived is worth more than an exception that hides it
+        self.assertEqual(result.text, "The timeout is five seconds")
+        self.assertEqual(result.stopped_reason, "interrupted")
+        self.assertIn("connection reset", result.interrupted)
+        self.assertFalse(result.interrupted_by_user)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.as_dict()["interrupted"], result.interrupted)
+
+    def test_failure_before_any_text_still_raises(self):
+        from oneharness.errors import ProviderError
+
+        class DeadStream(Provider):
+            name = "dead"
+
+            def __init__(self):
+                super().__init__(model="m")
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("must not be called")
+
+            def stream(self, messages, tools=None):
+                raise ProviderError("connection reset by peer")
+                yield  # pragma: no cover - makes this a generator
+
+        with self.assertRaises(ProviderError):
+            Agent(DeadStream()).run("go", stream=True)
+
+    def test_interrupt_keeps_partial_text_and_exits_130(self):
+        class Interrupted(Provider):
+            name = "interrupted"
+
+            def __init__(self):
+                super().__init__(model="m")
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("must not be called")
+
+            def stream(self, messages, tools=None):
+                yield StreamEvent(kind="text", text="half a thou")
+                raise KeyboardInterrupt
+
+        events = []
+        result = Agent(Interrupted(), on_event=events.append).run("go", stream=True)
+        self.assertEqual(result.text, "half a thou")
+        self.assertTrue(result.interrupted_by_user)
+        self.assertEqual(result.stopped_reason, "interrupted")
+        self.assertIn("interrupted", [e["type"] for e in events])
 
     def test_result_serialises(self):
         provider = ScriptedProvider(tool_reply("add", '{"a": 1, "b": 2}'), text_reply("3"))

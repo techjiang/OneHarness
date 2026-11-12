@@ -174,6 +174,22 @@ class SigningTests(unittest.TestCase):
             )
 
 
+class BedrockStreamAnnouncementTests(unittest.TestCase):
+    def test_tool_use_is_announced_at_block_start_and_stitched(self):
+        with BedrockRecorder(frames=stream_frames(["hi"])) as recorder:
+            provider = provider_for(recorder)
+            out = list(provider.stream([Message.user("go")]))
+
+        announced = [e for e in out if e.kind == "tool"]
+        # one announcement per tool block, then the argument fragments
+        starts = [e for e in announced if not e.fragment]
+        self.assertEqual([e.call.name for e in starts], ["read_file", "add"])
+        self.assertEqual(starts[0].call.id, "tu-1")
+        fragments = "".join(e.fragment for e in announced if e.index == 1)
+        self.assertEqual(fragments, '{"a": 1, "b": 2}')
+        self.assertEqual(out[-1].completion.tool_calls[1].arguments, {"a": 1, "b": 2})
+
+
 class ConversePayloadTests(unittest.TestCase):
     def test_system_prompt_is_a_block_list_not_a_message(self):
         with BedrockRecorder() as recorder:

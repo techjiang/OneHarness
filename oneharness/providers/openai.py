@@ -12,7 +12,14 @@ from typing import Any
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.transport import post_json, post_sse
-from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
+from oneharness.types import (
+    STREAM_ENDED_EARLY,
+    Completion,
+    Message,
+    StreamEvent,
+    ToolCall,
+    Usage,
+)
 
 
 class OpenAIProvider(Provider):
@@ -82,16 +89,27 @@ class OpenAIProvider(Provider):
                 yield StreamEvent(kind="text", text=piece)
 
             for raw in delta.get("tool_calls") or ():
-                slot = calls.setdefault(
-                    int(raw.get("index", len(calls))), {"id": "", "name": "", "arguments": ""}
-                )
+                index = int(raw.get("index", len(calls)))
+                slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
                 if raw.get("id"):
                     slot["id"] = raw["id"]
                 function = raw.get("function") or {}
                 if function.get("name"):
                     slot["name"] = function["name"]
-                if function.get("arguments"):
-                    slot["arguments"] += function["arguments"]
+                fragment = function.get("arguments") or ""
+                slot["arguments"] += fragment
+                # Announced as it is assembled, not when the turn closes: the
+                # name arrives in one chunk and the arguments in many, and
+                # someone watching should not learn about a `write_file` only
+                # after the whole body has been generated.
+                yield StreamEvent(
+                    kind="tool",
+                    index=index,
+                    fragment=fragment,
+                    call=ToolCall(
+                        id=slot["id"] or f"call_{index}", name=slot["name"], raw_arguments=""
+                    ),
+                )
 
         message = Message.assistant(
             "".join(text),
@@ -112,6 +130,10 @@ class OpenAIProvider(Provider):
                 model=model,
                 stop_reason=stop_reason,
                 raw={"streamed": True},
+                # No `finish_reason` means the body ended without the provider
+                # saying it was done. Saying `done` here would be this adapter
+                # inventing an ending the server never sent.
+                truncated=None if stop_reason else STREAM_ENDED_EARLY,
             ),
         )
 

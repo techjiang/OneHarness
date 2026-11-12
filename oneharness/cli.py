@@ -26,6 +26,7 @@ from oneharness.types import Message
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_USAGE = 2
+EXIT_INTERRUPTED = 130
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -237,6 +238,39 @@ def _connect_mcp(
     return tools, clients
 
 
+class _Printer:
+    """The observer, plus a count of how much answer text actually reached stdout.
+
+    The count matters: `_report` must not assume a streamed run printed
+    anything. A provider that answers in one `done` event (or one that does not
+    implement `stream()` at all) produces no deltas, and "the tokens already
+    went to stdout" would then print a blank line instead of the answer.
+    """
+
+    def __init__(self, stream: bool, quiet: bool = False) -> None:
+        self.stream = stream
+        self.quiet = quiet
+        self.open_line = False
+        # Which assembled call currently owns the growing stderr line, if any.
+        # Two calls in one turn interleave their fragments, so the line has to
+        # say whose arguments these are -- otherwise the reader cannot tell
+        # whether a `,` belongs to the first call or the second.
+        self.drawing: str | None = None
+        self.announced: dict[str, str] = {}  # call id -> the label it was drawn under
+        self.chars = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, event: dict[str, Any]) -> None:
+        if self.quiet:
+            return
+        with self._lock:
+            _render(event, self, self.stream)
+
+    @property
+    def printed_text(self) -> bool:
+        return self.chars > 0
+
+
 def _printer(quiet: bool, stream: bool = False):
     """Progress on stderr, streamed answer text on stdout.
 
@@ -248,36 +282,48 @@ def _printer(quiet: bool, stream: bool = False):
     unreadable, and the tag is what makes the parallelism legible. Those events
     come from several threads at once, so the whole thing sits behind one lock.
     """
-    state = {"open_line": False}
-    lock = threading.Lock()
-
-    def observe(event: dict[str, Any]) -> None:
-        if quiet:
-            return
-        with lock:
-            _render(event, state, stream)
-
-    return observe
+    return _Printer(stream, quiet)
 
 
-def _render(event: dict[str, Any], state: dict[str, bool], stream: bool) -> None:
+def _render(event: dict[str, Any], state: Any, stream: bool) -> None:
     kind = event.get("type")
     depth = int(event.get("depth", 0))
     label = event.get("label")
     pad = "    " * depth
     tag = f"{pad}[{label}] " if label else pad
 
+    if kind == "tool_call_delta":
+        # Drawn as a growing line: the arguments exist one fragment at a time,
+        # and showing that growth is the whole point of surfacing them. When the
+        # call is finally complete this line is simply closed, instead of being
+        # printed a second time by `tool_start`.
+        _render_tool_delta(event, state, tag)
+        return
+
     if kind == "text_delta" and stream:
         # A sub agent's tokens are not the answer the user asked for; they
         # would splice straight into the parent's sentence on stdout.
         if not depth:
-            print(event.get("text", ""), end="", flush=True)
-            state["open_line"] = True
+            piece = event.get("text", "")
+            print(piece, end="", flush=True)
+            state.open_line = True
+            state.chars += len(piece)
         return
 
-    if state["open_line"]:
+    if state.open_line:
         print(flush=True)  # keep streamed text and tool chatter on separate lines
-        state["open_line"] = False
+        state.open_line = False
+
+    if kind == "tool_start" and str(event.get("id")) in state.announced:
+        # The growing line already showed this tool and its arguments; all that
+        # is left is to close the parenthesis it left open, if it is still the
+        # line on screen.
+        if state.drawing == state.announced.pop(str(event.get("id"))):
+            print(")", file=sys.stderr)
+            state.drawing = None
+        return
+
+    _close_assembly(state)
 
     if kind == "tool_start":
         args = json.dumps(event.get("arguments", {}), ensure_ascii=False)
@@ -302,6 +348,11 @@ def _render(event: dict[str, Any], state: dict[str, bool], stream: bool) -> None
         )
     elif kind == "mcp_tool":
         print(f"{tag}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
+    elif kind == "interrupted":
+        print(
+            f"{tag}! {event['reason']} -- kept {event['chars']} chars it had already said",
+            file=sys.stderr,
+        )
     elif kind == "subagent_start":
         task = str(event.get("task", "")).replace("\n", " ")
         print(f"{tag}⇢ {task[:100]}", file=sys.stderr)
@@ -313,12 +364,60 @@ def _render(event: dict[str, Any], state: dict[str, bool], stream: bool) -> None
         )
 
 
+def _close_assembly(state: _Printer) -> None:
+    """End a growing tool line, so the next message starts on its own row."""
+    if state.drawing is None:
+        return
+    # `…` not `)`: these arguments may still be arriving, and a closing bracket
+    # would claim the call is complete when it is not.
+    print("…", file=sys.stderr)
+    state.drawing = None
+
+
+def _render_tool_delta(event: dict[str, Any], state: _Printer, tag: str) -> None:
+    """One growing stderr line per tool call being assembled.
+
+    The label carries the provider's own index (`write_file#0`), because two
+    calls in one turn interleave their fragments and a reader has to be able to
+    tell whose argument this is. Reading the label along with the fragment
+    reconstructs both calls, which no amount of pretty-printing can replace.
+    """
+    if state.open_line:
+        print(flush=True)
+        state.open_line = False
+
+    call_id = str(event.get("id"))
+    label = f"{event.get('name', '')}#{event.get('index', 0)}"
+    state.announced[call_id] = label
+
+    if state.drawing != label:
+        if state.drawing is not None:
+            print("…", file=sys.stderr)
+        print(f"{tag}… {label}(", end="", file=sys.stderr, flush=True)
+        state.drawing = label
+    _write_fragment(event.get("fragment") or "")
+
+
+def _write_fragment(fragment: str) -> None:
+    """Newlines and tabs are shown escaped: this is one line that keeps growing.
+
+    A fragment of `"content": "timeout=30\n"` printed literally would break the
+    line into pieces and push the rest of the call off the screen, which defeats
+    the point of drawing it at all.
+    """
+    if not fragment:
+        return
+    escaped = fragment.replace("\n", "\\n").replace("\t", "\\t")
+    print(escaped, end="", file=sys.stderr, flush=True)
+
+
 def _report(
     result: AgentResult,
     as_json: bool,
     streamed: bool = False,
     delegation: dict[str, Any] | None = None,
 ) -> None:
+    """`streamed` means the answer text already reached stdout, not "was a stream"."""
     if as_json:
         payload = result.as_dict()
         if delegation is not None:
@@ -334,6 +433,11 @@ def _report(
             f"[stopped after {len(result.steps)} steps without a final answer]",
             file=sys.stderr,
         )
+    elif result.interrupted:
+        # The reason itself was already printed by the `interrupted` event while
+        # the run was going; repeating it here would just be the same sentence
+        # twice. What matters at the end is that the answer is not whole.
+        print("[the answer above is incomplete]", file=sys.stderr)
 
 
 def _report_delegation(delegator: Delegator | None, quiet: bool = False) -> None:
@@ -382,10 +486,14 @@ def cmd_run(args: argparse.Namespace) -> int:
             for client in clients:
                 client.close()
     delegation = delegator.as_dict() if delegator is not None and delegator.runs else None
-    _report(result, args.json, stream, delegation)
+    # Not `stream`: a streamed run whose tokens never reached stdout (a provider
+    # that answers in one `done` event) still needs the answer printed here.
+    _report(result, args.json, stream and observer.printed_text, delegation)
     _report_delegation(delegator, args.quiet)
     if tape is not None and not args.quiet:
         _report_tape(tape)
+    if result.interrupted_by_user:
+        return EXIT_INTERRUPTED  # what a shell expects from Ctrl-C
     return EXIT_OK if result.ok else EXIT_ERROR
 
 
