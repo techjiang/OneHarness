@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from oneharness.config import Config, find_config_file, load_config
 from oneharness.errors import ConfigError
@@ -72,6 +73,49 @@ class McpConfigTests(unittest.TestCase):
     def test_mcp_must_be_a_table_array(self):
         path = self.write('mcp = "nope"\n')
         with self.assertRaises(ConfigError):
+            load_config(path)
+
+
+class DelegateAndParallelConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, text):
+        path = self.root / "oneharness.toml"
+        path.write_text(text)
+        return path
+
+    def test_delegate_table(self):
+        config = load_config(self.write('[delegate]\nmax_steps = 3\nsystem = "be brief"\n'))
+        self.assertTrue(config.delegate.enabled)
+        self.assertEqual(config.delegate.max_steps, 3)
+        self.assertEqual(config.delegate.system, "be brief")
+        self.assertTrue(config.as_dict()["delegate"]["enabled"])
+
+    def test_delegate_is_off_by_default(self):
+        self.assertFalse(load_config(self.write('[provider]\nmodel = "m"\n')).delegate.enabled)
+
+    def test_delegate_unknown_key_rejected(self):
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(self.write("[delegate]\nnope = 1\n"))
+        self.assertIn("unknown [delegate] keys", str(ctx.exception))
+
+    def test_max_parallel_clamps_to_one(self):
+        self.assertEqual(load_config(self.write("max_parallel = 0\n")).max_parallel, 1)
+        self.assertEqual(load_config(self.write("max_parallel = 4\n")).max_parallel, 4)
+
+    def test_max_parallel_env_override(self):
+        path = self.write("max_parallel = 2\n")
+        with mock.patch.dict(os.environ, {"ONEHARNESS_MAX_PARALLEL": "5"}):
+            self.assertEqual(load_config(path).max_parallel, 5)
+        with (
+            mock.patch.dict(os.environ, {"ONEHARNESS_MAX_PARALLEL": "x"}),
+            self.assertRaises(ConfigError),
+        ):
             load_config(path)
 
 

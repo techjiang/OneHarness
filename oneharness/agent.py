@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.tools import Registry
-from oneharness.types import Completion, Message, ToolResult, Usage
+from oneharness.types import Completion, Message, ToolCall, ToolResult, Usage
 
 Observer = Callable[[dict[str, Any]], None]
 
@@ -20,6 +22,7 @@ class Step:
 
     completion: Completion
     tool_results: list[ToolResult] = field(default_factory=list)
+    seconds: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -27,6 +30,7 @@ class Step:
             "tool_calls": [call.as_dict() for call in self.completion.tool_calls],
             "tool_results": [result.as_dict() for result in self.tool_results],
             "usage": self.completion.usage.as_dict(),
+            "seconds": round(self.seconds, 3),
         }
 
 
@@ -71,14 +75,18 @@ class Agent:
         system: str | None = None,
         max_steps: int = 8,
         on_event: Observer | None = None,
+        max_parallel: int = 1,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
+        if max_parallel < 1:
+            raise ValueError("max_parallel must be at least 1")
         self.provider = provider
         self.tools = tools if isinstance(tools, Registry) else Registry(tools or ())
         self.system = system
         self.max_steps = max_steps
         self.on_event = on_event
+        self.max_parallel = max_parallel
 
     def run(
         self,
@@ -101,6 +109,7 @@ class Agent:
         final_text = ""
 
         for index in range(self.max_steps):
+            started = time.monotonic()
             self._emit({"type": "step_start", "step": index + 1})
             completion = self._complete(messages, specs, stream=stream, step=index + 1)
 
@@ -124,19 +133,18 @@ class Agent:
                 stopped = "done"
                 break
 
-            for call in completion.tool_calls:
-                self._emit({"type": "tool_start", "name": call.name, "arguments": call.arguments})
-                result = self.tools.execute(call)
-                step.tool_results.append(result)
+            step.tool_results.extend(self._run_tools(completion.tool_calls, step_index=index + 1))
+            for result in step.tool_results:
                 messages.append(result.as_message())
-                self._emit(
-                    {
-                        "type": "tool_end",
-                        "name": call.name,
-                        "is_error": result.is_error,
-                        "content": result.content,
-                    }
-                )
+            step.seconds = time.monotonic() - started
+            self._emit(
+                {
+                    "type": "step_end",
+                    "step": index + 1,
+                    "seconds": round(step.seconds, 3),
+                    "tool_calls": len(completion.tool_calls),
+                }
+            )
         else:
             # Budget exhausted while the model still wanted tools.
             stopped = "max_steps"
@@ -149,6 +157,50 @@ class Agent:
             usage=total,
             stopped_reason=stopped,
             model=getattr(self.provider, "model", None),
+        )
+
+    def _run_tools(self, calls: Sequence[ToolCall], *, step_index: int) -> list[ToolResult]:
+        """Execute one turn's tool calls, in order or side by side.
+
+        A model that asks for six independent reads should not wait for six
+        round trips. Parallel execution is opt-in (`max_parallel`) because
+        tools are not assumed to be thread safe: a shell tool and a file tool
+        racing on the same path is a real hazard, and the caller knows better.
+        """
+        for call in calls:
+            self._emit({"type": "tool_start", "name": call.name, "arguments": call.arguments})
+
+        if self.max_parallel == 1 or len(calls) == 1:
+            results = []
+            for call in calls:
+                result = self.tools.execute(call)
+                results.append(result)
+                self._emit_tool_end(result)
+            return results
+
+        workers = min(self.max_parallel, len(calls))
+        finished: dict[int, ToolResult] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="oneharness-tool") as pool:
+            futures = {
+                pool.submit(self.tools.execute, call): index for index, call in enumerate(calls)
+            }
+            # Events fire as things actually finish (that is what a watcher wants
+            # to see), while the returned results keep the model's own order, so
+            # the message list stays predictable.
+            for future in as_completed(futures):
+                result = future.result()
+                finished[futures[future]] = result
+                self._emit_tool_end(result)
+        return [finished[index] for index in range(len(calls))]
+
+    def _emit_tool_end(self, result: ToolResult) -> None:
+        self._emit(
+            {
+                "type": "tool_end",
+                "name": result.name,
+                "is_error": result.is_error,
+                "content": result.content,
+            }
         )
 
     def _seed(self, prompt: str, history: Sequence[Message] | None) -> list[Message]:

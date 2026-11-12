@@ -11,6 +11,14 @@ temperature = 0
 [agent]
 system = "你是简洁的工程师，先读代码再动手。"
 max_steps = 8
+# 同一轮里模型要调多个工具时，最多同时跑几个（默认 1，串行）
+# max_parallel = 3
+
+# 可选：把「子 agent」作为一个工具交给模型。子 agent 有同样的工具和全新的
+# 上下文，父 agent 只拿到它最后的结论。
+# [delegate]
+# max_steps = 6
+# system = "只回答结果，不要复述任务。"
 
 # 可选：把 MCP server 的工具挂进来。每多一个 [[mcp]] 就多拉一个子进程。
 # [[mcp]]

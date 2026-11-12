@@ -18,6 +18,7 @@ main:
                 python examples/e2e_demo.py
                 python examples/stream_demo.py
                 python examples/mcp_demo.py
+                python examples/delegate_demo.py
 
   pull_request:
     - stages:

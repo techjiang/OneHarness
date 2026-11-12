@@ -11,3 +11,4 @@ temperature = 0
 [agent]
 system = "你是简洁的工程师，先读代码再动手。"
 max_steps = 8
+max_parallel = 3

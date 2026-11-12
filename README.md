@@ -2,12 +2,13 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做四件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做五件事：
 
 1. 把 OpenAI / Anthropic / Gemini 三种线格式抹平成同一个 `Completion`；
 2. 跑「模型要调工具 → 执行 → 结果回灌 → 再问」这个循环，且不让工具的错误炸掉循环；
 3. 支持流式输出，并且能在工具调用跨多个 chunk 时把它拼回来；
-4. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具。
+4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent；
+5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -69,6 +70,7 @@ $ oneharness run "修复测试" --workspace . --shell --max-steps 12
 $ oneharness run "ping" --provider deepseek --model deepseek-chat --json
 $ oneharness run "ping" --no-tools --quiet
 $ oneharness run "看看这个仓库" --stream
+$ oneharness run "整理这次改动" --delegate --parallel 4
 $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
 ```
 
@@ -80,9 +82,11 @@ $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/
   "stopped_reason": "done",
   "model": "deepseek-chat",
   "usage": {"input_tokens": 24, "output_tokens": 2, "total_tokens": 26},
-  "steps": [{"text": "pong", "tool_calls": [], "tool_results": [], "usage": {...}}]
+  "steps": [{"text": "pong", "tool_calls": [], "tool_results": [], "usage": {...}, "seconds": 0.61}]
 }
 ```
+
+`--json` 与 `--delegate` 可以一起用：子 agent 的 token 单独打到 stderr，stdout 保持是纯 JSON。
 
 退出码：`0` 正常收尾，`1` 配置/网络/工具链出错或步数耗尽，`2` 参数错误（argparse 惯例）。
 
@@ -138,7 +142,68 @@ prefix = "fs."     # 可选；两个 server 有同名工具时用它区分
 - **工具名撞车在启动时就报错**，不会留到运行中途才 ambiguous。服务器在 run 结束时一定被关掉，
   异常路径也一样。
 
+## 子 agent
+
+`--delegate` 把 `delegate(task)` 交给模型。子 agent 有同样的工具、自己的 system prompt、
+自己的消息列表——**父 agent 只看到最后一句结论**，中间那二十次读文件永远不会进父的上下文。
+
+```console
+$ oneharness run "看看这个仓库的超时配置合不合理" --delegate
+  → delegate({"task": "读取 app.conf 和 notes.md，告诉我超时配了多少"})
+  ⇢ sub agent: 读取 app.conf 和 notes.md，告诉我超时配了多少
+        → read_file({"path": "app.conf"})
+        ✓ read_file: timeout=5
+        → read_file({"path": "notes.md"})
+        ✓ read_file: - 5 秒对真实请求太短 - 目标是 30 秒
+  ⇠ sub agent done: 3 step(s), 660 tokens
+  ✓ delegate: app.conf: timeout=5；notes.md 里写着 5 秒对真实请求太短。结论：需要调大。
+[delegated 1 task(s): 580 in / 80 out tokens]
+```
+
+三件事值得说明：
+
+- **子 agent 不能再委派。** `delegate` 工具在建子 agent 时就被剔除了，递归深度靠结构保证，
+  不靠一个没人检查的计数器。
+- **花费单独记账。** 上面那行 `[delegated ...]` 是子 agent 自己的 token 数，不并进父 agent 的
+  `result.usage`。「父花了 2 分、子花了 3 毛」是个应该能看见的事实。
+- **子 agent 没答案不算成功。** 它烧完 `max_steps` 还是没给结论时，父 agent 收到的是一条
+  `is_error=True` 的工具结果（不是异常），可以自己决定换路数。
+
+也可以只用一个工具，不接管 CLI：
+
+```python
+from oneharness import Agent, Delegator, Registry, create_provider, default_tools
+
+provider = create_provider("openai")
+delegator = Delegator(provider, default_tools("."), max_steps=6)
+agent = Agent(provider, Registry([*default_tools("."), delegator.tool()]))
+print(agent.run("把 README 的错别字都找出来改成 PR").text)
+print(delegator.runs, delegator.usage.as_dict())   # 子 agent 花了多少
+```
+
+## 并发工具
+
+默认串行——工具没被假定线程安全。要并发就显式给数：
+
+```console
+$ oneharness run "把三条命令都跑一遍" --shell --parallel 3
+  → run_shell({"command": "sleep 0.9 && echo alpha"})
+  → run_shell({"command": "sleep 0.5 && echo beta"})
+  → run_shell({"command": "sleep 0.2 && echo gamma"})
+  ✓ run_shell: exit_code=0 gamma
+  ✓ run_shell: exit_code=0 beta
+  ✓ run_shell: exit_code=0 alpha
+```
+
+三条刻意错开的 sleep：顺序跑 1.61s，`--parallel 3` 跑 0.91s，而且完成顺序反过来——
+这才是「真的同时跑了」而不是「排着队跑完了」的证据（`examples/delegate_demo.py` 实测）。
+
+一个刻意的不对称：**事件按真实完成顺序发出，回灌给模型的结果按模型请求的顺序排列**。
+前者是给看日志的人，后者是给模型的可预测性。单个工具失败仍然只影响自己那一格，
+不影响同批的其他工具，也不炸循环。
+
 ## 配置
+
 
 就近找 `oneharness.toml`（从当前目录逐级向上，最后看 `~/.config/`）：
 
@@ -152,10 +217,15 @@ max_tokens = 4096
 [agent]
 system = "你是简洁的工程师，先看代码再改。"
 max_steps = 8
+max_parallel = 3             # 同一轮里的工具并发数，默认 1
+
+[delegate]                   # 写了这张表就等于打开 --delegate
+max_steps = 6
+# system = "只回答结果，不要复述任务。"
 ```
 
 环境变量优先于文件：`ONEHARNESS_PROVIDER`、`ONEHARNESS_MODEL`、`ONEHARNESS_API_KEY`、
-`ONEHARNESS_BASE_URL`、`ONEHARNESS_SYSTEM`、`ONEHARNESS_MAX_STEPS`。
+`ONEHARNESS_BASE_URL`、`ONEHARNESS_SYSTEM`、`ONEHARNESS_MAX_STEPS`、`ONEHARNESS_MAX_PARALLEL`。
 
 API Key 走各 provider 的常规变量名：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、
 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、
@@ -197,8 +267,9 @@ model = "Qwen2.5-72B-Instruct"
 **没有内置重试模型决策。** provider 层的 429/5xx 会自动退避重试（`transport.py`），
 但「模型答得不对要不要重问」属于业务判断，交给调用方。
 
-**同步 API。** 没有 asyncio。工具多半是文件 IO 和短 shell，并发收益不足以抵消复杂度；
-需要并发就跑多个进程。流式也不例外——SSE 是按行迭代的生成器，不需要 event loop。
+**没有 asyncio。** 流式不需要 event loop——SSE 是按行迭代的生成器。并发只用在唯一真正值得
+并发的地方：同一轮里的多个工具调用，用线程池，且要显式 `--parallel N` 才开。provider 请求
+永远串行，因为一个 agent 的下一步依赖上一步。
 
 **流式不改变结果形状。** token 通过 `on_event` 走旁路，agent 循环仍然只处理「已完成的一轮」。
 这样工具调用在中途出现时，行为和一次性返回时一模一样，不需要两套循环。
@@ -211,13 +282,14 @@ oneharness/
   transport.py    urllib 封装：JSON POST + SSE，带 429/5xx 退避重试
   providers/      base.py + openai.py + anthropic.py + gemini.py
   tools.py        @tool 装饰器、schema 生成、Registry
-  agent.py        工具调用循环，on_event 可观测，stream=True 分流 token
+  agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发
+  delegate.py     子 agent：独立上下文、独立记账、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
-  config.py       TOML + 环境变量 + [[mcp]]
+  config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / config
-tests/            124 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
-examples/         三个离线 demo：e2e / stream / mcp，都不需要 API Key
+tests/            147 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
+examples/         四个离线 demo：e2e / stream / mcp / delegate，都不需要 API Key
 ```
 
 ## 开发
@@ -227,6 +299,7 @@ $ python -m unittest discover -s tests -v    # 全部测试
 $ python examples/e2e_demo.py                # 端到端，起本地假 provider
 $ python examples/stream_demo.py             # 流式 + 跨 chunk 的工具调用
 $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
+$ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
 $ ruff check oneharness tests examples   # 风格（不格式 Markdown 里的示例）
 ```
 

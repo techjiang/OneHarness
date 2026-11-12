@@ -158,6 +158,115 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("MCP", err)
 
+    def test_delegate_flag_exposes_the_tool(self):
+        seen = {}
+
+        class TwoTurn:
+            name = "fake"
+            model = "fake-1"
+
+            def __init__(self):
+                self.turn = 0
+
+            def complete(self, messages, tools=None):
+                self.turn += 1
+                seen.setdefault("tools", [spec["name"] for spec in tools or ()])
+                if self.turn == 1:
+                    call = ToolCall.from_raw(
+                        call_id="c1", name="delegate", arguments={"task": "count files"}
+                    )
+                    return Completion(message=Message.assistant("", [call]))
+                return Completion(message=Message.assistant("1 file"))
+
+        with mock.patch.object(cli, "create_provider", return_value=TwoTurn()):
+            code, out, err = run_cli(["run", "go", "--delegate", "--workspace", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertIn("delegate", seen["tools"])
+        self.assertIn("sub agent", err)
+        self.assertIn("delegated 1 task", err)
+        self.assertEqual(out.strip(), "1 file")
+
+    def test_parallel_flag_reaches_the_agent(self):
+        captured = {}
+
+        class OneTurn:
+            name = "fake"
+            model = "fake-1"
+
+            def complete(self, messages, tools=None):
+                return Completion(message=Message.assistant("ok"))
+
+        original = cli.Agent
+
+        class Spy(original):
+            def __init__(self, *args, **kwargs):
+                captured["max_parallel"] = kwargs.get("max_parallel")
+                super().__init__(*args, **kwargs)
+
+        with (
+            mock.patch.object(cli, "create_provider", return_value=OneTurn()),
+            mock.patch.object(cli, "Agent", Spy),
+        ):
+            code, _, _ = run_cli(["run", "go", "--parallel", "4", "--workspace", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["max_parallel"], 4)
+
+    def test_printer_ignores_sub_agent_tokens(self):
+        """A nested run's tokens are not the answer; they must not hit stdout."""
+        out, err = io.StringIO(), io.StringIO()
+        observe = cli._printer(quiet=False, stream=True)
+        with redirect_stdout(out), redirect_stderr(err):
+            observe({"type": "text_delta", "text": "spliced", "depth": 1})
+            observe({"type": "subagent_start", "task": "go"})
+            observe({"type": "text_delta", "text": "answer"})
+        self.assertNotIn("spliced", out.getvalue())
+        self.assertIn("answer", out.getvalue())
+        self.assertIn("sub agent", err.getvalue())
+
+    def test_stream_with_delegate_prints_the_answer_once(self):
+        class TwoTurn:
+            name = "fake"
+            model = "fake-1"
+
+            def __init__(self):
+                self.turn = 0
+
+            def complete(self, messages, tools=None):
+
+                self.turn += 1
+                if self.turn == 1:  # the sub agent, which never streams
+                    return Completion(message=Message.assistant("sub says hi"))
+                raise AssertionError("the parent should stream, not complete")
+
+            def stream(self, messages, tools=None):
+                from oneharness.types import StreamEvent
+
+                self.turn += 1
+                if self.turn == 1:
+                    call = ToolCall.from_raw(
+                        call_id="c1", name="delegate", arguments={"task": "say hi"}
+                    )
+                    done = Completion(Message.assistant("", [call]))
+                    yield StreamEvent(kind="done", completion=done)
+                    return
+                for piece in ("parent ", "answer"):
+                    yield StreamEvent(kind="text", text=piece)
+                done = Completion(Message.assistant("parent answer"))
+                yield StreamEvent(kind="done", completion=done)
+
+        with mock.patch.object(cli, "create_provider", return_value=TwoTurn()):
+            code, out, err = run_cli(
+                ["run", "go", "--stream", "--delegate", "--workspace", str(self.root)]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("parent answer"), 1)
+        self.assertIn("sub agent", err)
+
+    def test_parallel_rejects_zero(self):
+        code, _, err = run_cli(["run", "go", "--parallel", "0"])
+        self.assertEqual(code, 1)
+        self.assertIn("at least 1", err)
+
     def test_parse_error_for_unknown_flag(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
             cli.main(["run", "hi", "--nope"])

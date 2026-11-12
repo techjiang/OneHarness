@@ -112,6 +112,13 @@ class Usage:
             output_tokens=self.output_tokens + other.output_tokens,
         )
 
+    def __sub__(self, other: Usage) -> Usage:
+        """Used to isolate what a sub agent spent during one run."""
+        return Usage(
+            input_tokens=self.input_tokens - other.input_tokens,
+            output_tokens=self.output_tokens - other.output_tokens,
+        )
+
     def as_dict(self) -> dict[str, int]:
         return {
             "input_tokens": self.input_tokens,

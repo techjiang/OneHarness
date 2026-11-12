@@ -13,6 +13,7 @@ from oneharness import __version__
 from oneharness.agent import Agent, AgentResult
 from oneharness.builtin import default_tools
 from oneharness.config import Config, McpServerConfig, load_config
+from oneharness.delegate import Delegator
 from oneharness.errors import ConfigError, OneHarnessError
 from oneharness.mcp import McpClient, McpError
 from oneharness.providers import PRESETS, create_provider, list_presets
@@ -41,6 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--workspace", default=".", help="workspace root for file tools")
         sub.add_argument("--shell", action="store_true", help="enable the run_shell tool")
         sub.add_argument("--no-tools", action="store_true", help="run without any tools")
+        sub.add_argument(
+            "--parallel",
+            type=int,
+            metavar="N",
+            help="run up to N tool calls of one turn at once (default 1, sequential)",
+        )
+        sub.add_argument(
+            "--delegate",
+            action="store_true",
+            help="expose a `delegate` tool that hands a task to a sub agent",
+        )
         sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         sub.add_argument("--quiet", action="store_true", help="hide progress events")
         sub.add_argument("--stream", action="store_true", help="print tokens as they arrive")
@@ -78,22 +90,48 @@ def _resolve_config(args: argparse.Namespace) -> Config:
         config.system = args.system
     if getattr(args, "max_steps", None):
         config.max_steps = args.max_steps
+    if getattr(args, "parallel", None) is not None:
+        if args.parallel < 1:
+            raise ConfigError("--parallel must be at least 1")
+        config.max_parallel = args.parallel
+    if getattr(args, "delegate", False):
+        config.delegate.enabled = True
     return config
 
 
-def _build_agent(args: argparse.Namespace, config: Config, observer=None, extra=()) -> Agent:
+def _build_agent(
+    args: argparse.Namespace, config: Config, observer=None, extra=()
+) -> tuple[Agent, Delegator | None]:
     provider = create_provider(config.provider.preset, **config.provider.options())
     tools: list[Tool] = []
     if not getattr(args, "no_tools", False):
         tools = default_tools(args.workspace, shell=getattr(args, "shell", False))
     tools.extend(extra)
-    return Agent(
+
+    delegator: Delegator | None = None
+    if config.delegate.enabled:
+        # The sub agent gets the same tools minus `delegate` itself, so it can
+        # never recurse, and the same provider, so the parent can hand off a
+        # task without a second round of configuration.
+        delegator = Delegator(
+            provider,
+            tools,
+            system=config.delegate.system,
+            max_steps=config.delegate.max_steps,
+            max_parallel=config.max_parallel,
+            on_event=observer,
+        )
+        tools.append(delegator.tool())
+
+    agent = Agent(
         provider,
         Registry(tools),
         system=config.system,
         max_steps=config.max_steps,
+        max_parallel=config.max_parallel,
         on_event=observer,
     )
+    return agent, delegator
 
 
 def _mcp_servers(args: argparse.Namespace, config: Config) -> list[McpServerConfig]:
@@ -148,6 +186,8 @@ def _printer(quiet: bool, stream: bool = False):
 
     Streaming puts tokens on stdout without newlines, so anything printed to
     stderr in between would land on the same visual line; close the line first.
+    Sub-agent events arrive with `depth: 1` and get indented, because a nested
+    run that looks identical to the parent run is just noise.
     """
     open_line = False
 
@@ -156,10 +196,15 @@ def _printer(quiet: bool, stream: bool = False):
         if quiet:
             return
         kind = event.get("type")
+        pad = "    " * int(event.get("depth", 0))
+        label = f"{pad}    " if pad else "  "
 
         if kind == "text_delta" and stream:
-            print(event.get("text", ""), end="", flush=True)
-            open_line = True
+            # A sub agent's tokens are not the answer the user asked for; they
+            # would splice straight into the parent's sentence on stdout.
+            if not event.get("depth"):
+                print(event.get("text", ""), end="", flush=True)
+                open_line = True
             return
 
         if open_line:
@@ -168,13 +213,23 @@ def _printer(quiet: bool, stream: bool = False):
 
         if kind == "tool_start":
             args = json.dumps(event.get("arguments", {}), ensure_ascii=False)
-            print(f"  → {event['name']}({args})", file=sys.stderr)
+            print(f"{label}→ {event['name']}({args})", file=sys.stderr)
         elif kind == "tool_end":
             mark = "!" if event.get("is_error") else "✓"
             preview = str(event.get("content", "")).replace("\n", " ")[:120]
-            print(f"  {mark} {event['name']}: {preview}", file=sys.stderr)
+            print(f"{label}{mark} {event['name']}: {preview}", file=sys.stderr)
         elif kind == "mcp_tool":
-            print(f"  + mcp {event['server']}: {event['name']}", file=sys.stderr)
+            print(f"{label}+ mcp {event['server']}: {event['name']}", file=sys.stderr)
+        elif kind == "subagent_start":
+            task = str(event.get("task", "")).replace("\n", " ")
+            print(f"{pad}  ⇢ sub agent: {task[:100]}", file=sys.stderr)
+        elif kind == "subagent_end":
+            usage = event.get("usage") or {}
+            print(
+                f"{pad}  ⇠ sub agent done: {event.get('steps')} step(s), "
+                f"{usage.get('total_tokens', 0)} tokens",
+                file=sys.stderr,
+            )
 
     return observe
 
@@ -194,6 +249,22 @@ def _report(result: AgentResult, as_json: bool, streamed: bool = False) -> None:
         )
 
 
+def _report_delegation(delegator: Delegator | None, quiet: bool = False) -> None:
+    """Sub-agent tokens are not the parent's, so they get their own line.
+
+    It goes to stderr even under `--json`: stdout stays a pure document, and a
+    human watching the run still learns that someone else spent tokens.
+    """
+    if delegator is None or not delegator.runs or quiet:
+        return
+    usage = delegator.usage
+    print(
+        f"[delegated {delegator.runs} task(s): "
+        f"{usage.input_tokens} in / {usage.output_tokens} out tokens]",
+        file=sys.stderr,
+    )
+
+
 def _with_mcp(
     args: argparse.Namespace, config: Config, observer
 ) -> tuple[list[Tool], list[McpClient]]:
@@ -209,12 +280,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     observer = _printer(args.quiet, stream)
     tools, clients = _with_mcp(args, config, observer)
     try:
-        agent = _build_agent(args, config, observer, tools)
+        agent, delegator = _build_agent(args, config, observer, tools)
         result = agent.run(" ".join(args.prompt), stream=stream)
     finally:
         for client in clients:
             client.close()
     _report(result, args.json, stream)
+    _report_delegation(delegator, args.quiet)
     return EXIT_OK if result.ok else EXIT_ERROR
 
 
@@ -226,7 +298,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
     history: list[Message] = []
 
     try:
-        agent = _build_agent(args, config, observer, tools)
+        agent, _ = _build_agent(args, config, observer, tools)
         if not args.quiet:
             print(f"oneharness {__version__} · {config.provider.preset}/{agent.provider.model}")
             print("Type your message. Ctrl-D or 'exit' to quit.\n")
@@ -275,7 +347,8 @@ def cmd_presets(_: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    print(json.dumps(config.as_dict(), indent=2))
+    # ensure_ascii=False: this is a human debugging command, not a data feed.
+    print(json.dumps(config.as_dict(), indent=2, ensure_ascii=False))
     return EXIT_OK
 
 

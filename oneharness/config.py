@@ -61,10 +61,28 @@ class McpServerConfig:
 
 
 @dataclass(slots=True)
+class DelegateConfig:
+    """Settings for the `delegate` tool that hands work to a sub agent."""
+
+    enabled: bool = False
+    max_steps: int = 6
+    system: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_steps": self.max_steps,
+            "system": self.system,
+        }
+
+
+@dataclass(slots=True)
 class Config:
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     system: str | None = None
     max_steps: int = 8
+    max_parallel: int = 1
+    delegate: DelegateConfig = field(default_factory=DelegateConfig)
     mcp: list[McpServerConfig] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -78,6 +96,8 @@ class Config:
             },
             "system": self.system,
             "max_steps": self.max_steps,
+            "max_parallel": self.max_parallel,
+            "delegate": self.delegate.as_dict(),
             "mcp": [server.as_dict() for server in self.mcp],
         }
 
@@ -112,7 +132,8 @@ def _read_toml(path: Path) -> dict[str, Any]:
             data = tomllib.load(handle)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
-    unknown = set(data) - {"provider", "system", "max_steps", "agent", "mcp"}
+    known = {"provider", "system", "max_steps", "max_parallel", "agent", "delegate", "mcp"}
+    unknown = set(data) - known
     if unknown:
         raise ConfigError(f"{path} has unknown sections: {', '.join(sorted(unknown))}")
     return data
@@ -131,18 +152,37 @@ def _merge(config: Config, data: dict[str, Any]) -> Config:
         setattr(config.provider, key, value)
 
     agent_data = data.get("agent", {})
-    if "system" in data:
-        config.system = data["system"]
-    if "max_steps" in data:
-        config.max_steps = int(data["max_steps"])
-    if isinstance(agent_data, dict):
-        if "system" in agent_data:
-            config.system = agent_data["system"]
-        if "max_steps" in agent_data:
-            config.max_steps = int(agent_data["max_steps"])
+    if not isinstance(agent_data, dict):
+        raise ConfigError("[agent] must be a table")
+    # Top level wins over [agent], which is the older spelling of the same keys.
+    top = ("system", "max_steps", "max_parallel")
+    settings = {**agent_data, **{key: data[key] for key in top if key in data}}
+    if "system" in settings:
+        config.system = settings["system"]
+    if "max_steps" in settings:
+        config.max_steps = int(settings["max_steps"])
+    if "max_parallel" in settings:
+        config.max_parallel = max(1, int(settings["max_parallel"]))
 
+    # A present `[delegate]` table turns the tool on; leaving it out keeps it off.
+    if "delegate" in data:
+        config.delegate = _read_delegate(data["delegate"])
     config.mcp = _read_mcp(data.get("mcp") or [])
     return config
+
+
+def _read_delegate(entry: Any) -> DelegateConfig:
+    """`[delegate]` table: turn the sub-agent tool on and size its budget."""
+    if not isinstance(entry, dict):
+        raise ConfigError("delegate must be a table ([delegate])")
+    unknown = set(entry) - set(DelegateConfig.__slots__)
+    if unknown:
+        raise ConfigError(f"unknown [delegate] keys: {', '.join(sorted(unknown))}")
+    return DelegateConfig(
+        enabled=bool(entry.get("enabled", True)),
+        max_steps=int(entry.get("max_steps") or 6),
+        system=entry.get("system"),
+    )
 
 
 def _read_mcp(entries: Any) -> list[McpServerConfig]:
@@ -183,16 +223,21 @@ def _apply_env(config: Config) -> Config:
         "BASE_URL": ("provider", "base_url"),
         "SYSTEM": ("system", None),
         "MAX_STEPS": ("max_steps", None),
+        "MAX_PARALLEL": ("max_parallel", None),
     }
     for suffix, (section, attr) in mapping.items():
         raw = os.environ.get(f"{ENV_PREFIX}{suffix}")
         if raw is None or raw == "":
             continue
-        if suffix == "MAX_STEPS":
+        if suffix in ("MAX_STEPS", "MAX_PARALLEL"):
             try:
-                config.max_steps = int(raw)
+                value = int(raw)
             except ValueError as exc:
-                raise ConfigError(f"{ENV_PREFIX}MAX_STEPS must be an integer") from exc
+                raise ConfigError(f"{ENV_PREFIX}{suffix} must be an integer") from exc
+            if suffix == "MAX_STEPS":
+                config.max_steps = value
+            else:
+                config.max_parallel = value
         elif section == "provider":
             setattr(config.provider, attr, raw)
         else:

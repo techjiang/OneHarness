@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from oneharness.agent import Agent
@@ -139,9 +140,19 @@ class AgentLoopTests(unittest.TestCase):
         Agent(provider, [add], on_event=events.append).run("go")
         kinds = [e["type"] for e in events]
         self.assertEqual(
-            kinds, ["step_start", "assistant", "tool_start", "tool_end", "step_start", "assistant"]
+            kinds,
+            [
+                "step_start",
+                "assistant",
+                "tool_start",
+                "tool_end",
+                "step_end",
+                "step_start",
+                "assistant",
+            ],
         )
         self.assertEqual(events[2]["name"], "add")
+        self.assertEqual(events[4]["tool_calls"], 1)
 
     def test_stream_mode_emits_deltas_and_keeps_result_shape(self):
         class StreamingProvider(Provider):
@@ -198,6 +209,82 @@ class AgentLoopTests(unittest.TestCase):
         result = Agent(provider, on_event=events.append).run("ping", stream=True)
         self.assertEqual(result.text, "pong")
         self.assertEqual([e["text"] for e in events if e["type"] == "text_delta"], ["pong"])
+
+    def test_parallel_tool_calls_overlap(self):
+        """Two slow tools in one turn should finish in about one tool's time."""
+
+        @tool
+        def slow(label: str) -> str:
+            """Sleep briefly, then answer."""
+            time.sleep(0.2)
+            return label
+
+        first = ToolCall.from_raw(call_id="c1", name="slow", arguments={"label": "a"})
+        second = ToolCall.from_raw(call_id="c2", name="slow", arguments={"label": "b"})
+        provider = ScriptedProvider(
+            Completion(message=Message.assistant("", [first, second])), text_reply("both done")
+        )
+        started = time.monotonic()
+        result = Agent(provider, [slow], max_parallel=2).run("go")
+        elapsed = time.monotonic() - started
+
+        self.assertEqual([r.content for r in result.steps[0].tool_results], ["a", "b"])
+        self.assertLess(elapsed, 0.38)
+
+    def test_parallel_results_keep_the_model_order(self):
+        @tool
+        def sleepy(name: str, delay: float) -> str:
+            """Sleep, then return the name so ordering is visible."""
+            time.sleep(delay)
+            return name
+
+        calls = [
+            ToolCall.from_raw(
+                call_id="c1", name="sleepy", arguments={"name": "slow", "delay": 0.2}
+            ),
+            ToolCall.from_raw(
+                call_id="c2", name="sleepy", arguments={"name": "fast", "delay": 0.01}
+            ),
+        ]
+        provider = ScriptedProvider(
+            Completion(message=Message.assistant("", calls)), text_reply("done")
+        )
+        events = []
+        result = Agent(provider, [sleepy], max_parallel=2, on_event=events.append).run("go")
+
+        # results follow the request order, not the completion order
+        self.assertEqual([r.content for r in result.steps[0].tool_results], ["slow", "fast"])
+        ended = [e["content"] for e in events if e["type"] == "tool_end"]
+        self.assertEqual(ended, ["fast", "slow"])
+
+    def test_parallel_failure_is_isolated(self):
+        @tool
+        def boom() -> str:
+            """Always fails."""
+            raise ValueError("kaboom")
+
+        calls = [
+            ToolCall.from_raw(call_id="c1", name="boom", arguments={}),
+            ToolCall.from_raw(call_id="c2", name="add", arguments={"a": 1, "b": 1}),
+        ]
+        provider = ScriptedProvider(
+            Completion(message=Message.assistant("", calls)), text_reply("recovered")
+        )
+        result = Agent(provider, [boom, add], max_parallel=2).run("go")
+        results = result.steps[0].tool_results
+        self.assertTrue(results[0].is_error)
+        self.assertEqual(results[1].content, "2")
+        self.assertTrue(result.ok)
+
+    def test_max_parallel_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            Agent(ScriptedProvider(), max_parallel=0)
+
+    def test_step_seconds_are_recorded(self):
+        provider = ScriptedProvider(tool_reply("add", '{"a": 1, "b": 2}'), text_reply("3"))
+        result = Agent(provider, [add]).run("go")
+        self.assertGreaterEqual(result.steps[0].seconds, 0.0)
+        self.assertIn("seconds", result.as_dict()["steps"][0])
 
     def test_result_serialises(self):
         provider = ScriptedProvider(tool_reply("add", '{"a": 1, "b": 2}'), text_reply("3"))
