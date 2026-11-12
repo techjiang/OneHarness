@@ -36,6 +36,7 @@ from typing import Any
 
 from oneharness.errors import ConfigError, OneHarnessError, ProviderError
 from oneharness.providers import PRESETS, create_provider, list_presets
+from oneharness.tape import TapeError
 from oneharness.types import Message
 
 PING = "ping"
@@ -134,6 +135,11 @@ def check(preset: str, *, timeout: float = 20.0, **overrides: Any) -> Probe:
         completion = provider.complete([Message.user(PING)])
     except ProviderError as exc:
         probe.status, probe.detail = classify(exc)
+    except TapeError:
+        # A mismatched tape is a broken fixture or a changed wire format, not a
+        # network condition. Reporting it as `network` would send the reader to
+        # look at DNS while the answer is "your request body changed".
+        raise
     except OneHarnessError as exc:
         probe.status, probe.detail = NETWORK, str(exc)
     except OSError as exc:  # DNS, TLS, proxy: not a provider error, still a verdict

@@ -90,6 +90,32 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("sk-invalid-oneharness-abc", probe.detail)
         self.assertIn("auth", probe.status)
 
+    def test_a_broken_tape_is_not_reported_as_a_network_problem(self):
+        # Found by trying to replay the wrong tape through `doctor --replay`:
+        # the mismatch surfaced as `network`, which points at DNS and is wrong.
+        from oneharness.tape import Tape, TapeError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mistyped.json"
+            with Tape.record(path):
+                pass
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "entries": [
+                            {
+                                "url": "https://api.openai.com/v1/chat/completions",
+                                "request": {"model": "something-else"},
+                                "response": {"status": 200, "body_b64": ""},
+                            }
+                        ],
+                    }
+                )
+            )
+            with Tape.replay(path), self.assertRaises(TapeError):
+                doctor.check("openai")
+
     def test_json_shape_is_stable(self):
         with Tape.replay(TAPES / "anthropic.json"):
             data = doctor.check("anthropic").as_dict()

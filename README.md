@@ -493,7 +493,7 @@ oneharness/
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config
-tests/            243 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
+tests/            244 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
 examples/         七个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor，都不需要 API Key
 ```
 
