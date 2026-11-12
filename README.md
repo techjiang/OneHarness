@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做五件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做六件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -10,7 +10,9 @@
 3. 支持流式输出，并且能在工具调用跨多个 chunk（或跨多个二进制帧）时把它拼回来；
 4. 一轮里的多个工具调用可以并发跑，也可以把整个任务丢给带全新上下文的子 agent ——
    包括一次派出去好几个；
-5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具。
+5. 用 TOML + 环境变量管配置，用一条命令跑起来，还能顺手接管 MCP server 的工具；
+6. 能验证自己：`doctor` 用真 provider 各发一次最小请求并**判断是谁的错**，
+   请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -63,6 +65,7 @@ $ oneharness --help
 | `oneharness chat` | 多轮交互会话，保留历史 |
 | `oneharness tools` | 列出内置工具及其参数 |
 | `oneharness presets` | 列出 provider 预设、默认模型和端点 |
+| `oneharness doctor` | 对真 provider 各发一次最小请求，判断配置/密钥/模型哪一层出问题 |
 | `oneharness config` | 打印解析后的配置（排查配置问题用） |
 
 常用参数：
@@ -74,6 +77,8 @@ $ oneharness run "ping" --no-tools --quiet
 $ oneharness run "看看这个仓库" --stream
 $ oneharness run "整理这次改动" --delegate --parallel 4
 $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
+$ oneharness run "ping" --record run.json     # 把这次的所有请求存成 tape
+$ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重放同一次
 ```
 
 `--json` 输出稳定的机器可读结构，适合挂到脚本里：
@@ -309,6 +314,73 @@ $ oneharness run "ping" --provider azure --model my-deployment
 `--model` 传的是部署名，`--provider azure` 的 `base_url` 省略时读 `AZURE_OPENAI_ENDPOINT`。
 两个都缺的时候报错会直接告诉你缺哪个，而不是在发请求时报 400。
 
+## doctor：把失败归到正确的层
+
+配置出问题时，报错都是一个红字，但「key 错了」「模型名错了」「URL 错了」「我们发错了」
+是完全不同的四件事，处理方法相反。`doctor` 发一个最小的真请求，然后读 provider 的原文判断：
+
+```console
+$ oneharness doctor openai anthropic gemini
+✗ openai     auth         Incorrect API key provided: sk-inva*****c123. ...
+             the request shape was accepted and the key was not: rotate the key
+✗ anthropic  auth         invalid x-api-key
+             the request shape was accepted and the key was not: rotate the key
+- deepseek   unconfigured no API key for provider 'deepseek'; set DEEPSEEK_API_KEY ...
+             not configured on this machine; set the key to test it
+```
+
+七个判定：
+
+| 判定 | 含义 | 该动哪里 |
+|---|---|---|
+| `ok` | 真答回来了 | —— |
+| `auth` | 请求形状被接受，凭证被拒 | 换 key |
+| `model` | key 有效，模型/部署名不对 | 改 model |
+| `endpoint` | 那个 URL 没人应答 | 改 base_url / region |
+| `quota` | 限流或余额 | 等，或换 key |
+| `protocol` | provider 说**我们的字段**不对 | OneHarness 的 bug |
+| `network` | 根本没答：DNS / TLS / 代理 / 超时 | 查网络 |
+| `unconfigured` | 本机没配这个 key | 配了再测 |
+
+关键是 `auth` 和 `protocol` 不能混。401 说「key 无效」证明请求本身没问题；
+400 说「unknown name messages」意味着这个 harness 发错了体，换对 key 也修不好。
+两者在日志里一样红，含义正好相反。
+
+`unconfigured` 不算失败，退出码仍是 0——一台机器通常只有一两个 key，缺的那些不该把 CI 染红。
+
+```console
+$ oneharness doctor --all --json     # 脚本里用
+```
+
+## tape：录一次真流量，之后离线重放
+
+`doctor` 能问真 provider，但测试不能每次都联网。`--record` 把一次运行的所有请求连同
+**原始响应字节**存进一个 JSON，`--replay` 之后原样喂回同一段解码代码：
+
+```console
+$ oneharness run "分析下 app.conf" --record session.json
+$ oneharness run "分析下 app.conf" --replay session.json    # 无 key、无网络
+```
+
+两条刻意的规矩：
+
+**存字节，不存解析结果。** 回放走的是同一个 SSE 行解析器、同一个二进制帧切分器、
+同一个 decoder——那才是可能写错的地方。存解析后的对象只能拿 decoder 验证它自己。
+
+**严格匹配。** 回放的请求必须和录下的逐字段一致，且按顺序消费。宽松匹配（同 URL 就用上一条）
+会把每一次线格式回归都变成绿灯，而红灯正是 fixture 存在的理由。不匹配时报出**哪个字段**变了：
+
+```console
+$ oneharness run "换个 prompt" --replay session.json
+oneharness: tape session.json exchange #1: request differs at request.messages[0].content
+(recorded 'ping', sent 'a different prompt'). The wire format changed; re-record the tape
+if the change is intentional.
+```
+
+header 一律不录。所以 tape 里不会有 API key，回放也不需要任何凭证——这就是
+`tests/fixtures/tapes/` 里那批文件能在 CI 跑的原因。它们不是假服务器的输出，
+是 OpenAI / Anthropic / Gemini / DeepSeek / Groq / Bedrock **真实回过的字节**。
+
 ## 配置
 
 
@@ -390,6 +462,12 @@ model = "Qwen2.5-72B-Instruct"
 `read1` 才是「有多少给多少」。SSE 路径没暴露过这个问题，因为按行迭代本来就是逐行阻塞的；
 二进制帧路径把它暴露了。
 
+**测试的假服务器是循环论证，得用真字节破它。** 假服务器是我按自己读的规范写的：
+我读错了，它也错，两边一起绿。所以 `tests/fixtures/tapes/` 存的是真端点的响应字节，
+`doctor` 对着它们跑。判成 `auth` 是有信息量的——它证明请求过了字段关、只卡在凭证上，
+这是任何自写假服务器都拿不到的结论。同一条「故意发错的 OpenAI 请求体给 Gemini」
+则拿到 `protocol`，证明这个判定真的会红。
+
 **没有 asyncio。** 流式不需要 event loop——SSE 是按行迭代的生成器。并发只用在唯一真正值得
 并发的地方：同一轮里的多个工具调用，用线程池，且要显式 `--parallel N` 才开。provider 请求
 永远串行，因为一个 agent 的下一步依赖上一步。
@@ -411,10 +489,12 @@ oneharness/
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
+  tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
+  doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
-  cli.py          run / chat / tools / presets / config
-tests/            205 个单元测试，含本地 HTTP mock 与真实 MCP 子进程
-examples/         六个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock，都不需要 API Key
+  cli.py          run / chat / tools / presets / doctor / config
+tests/            243 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape
+examples/         七个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor，都不需要 API Key
 ```
 
 ## 开发
@@ -427,6 +507,7 @@ $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
 $ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
 $ python examples/fanout_demo.py             # 一次派三个子 agent，逐个 vs 同时
 $ python examples/bedrock_demo.py           # 签名回验 + 二进制帧流，本地假 Bedrock
+$ python examples/doctor_demo.py            # 真端点录下的 tape 上跑 doctor + record/replay 闭环
 $ ruff check oneharness tests examples   # 风格（不格式 Markdown 里的示例）
 ```
 

@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "hint": "recorded from a real endpoint; headers are deliberately absent",
+  "entries": [
+    {
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-3-5-sonnet-20241022-v2%3A0/converse",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "text": "ping"
+              }
+            ]
+          }
+        ],
+        "inferenceConfig": {
+          "temperature": 0.0
+        }
+      },
+      "response": {
+        "status": 403,
+        "body_b64": "eyJtZXNzYWdlIjoiVGhlIHNlY3VyaXR5IHRva2VuIGluY2x1ZGVkIGluIHRoZSByZXF1ZXN0IGlzIGludmFsaWQuIn0="
+      }
+    }
+  ]
+}

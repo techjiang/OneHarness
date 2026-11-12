@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hint": "recorded from a real endpoint; headers are deliberately absent",
+  "entries": [
+    {
+      "url": "https://api.deepseek.com/v1/chat/completions",
+      "request": {
+        "model": "deepseek-chat",
+        "messages": [
+          {
+            "role": "user",
+            "content": "ping"
+          }
+        ],
+        "temperature": 0.0
+      },
+      "response": {
+        "status": 401,
+        "body_b64": "eyJlcnJvciI6eyJtZXNzYWdlIjoiQXV0aGVudGljYXRpb24gRmFpbHMsIFlvdXIgYXBpIGtleTogKioqKm5lc3MgaXMgaW52YWxpZCAocmVxdWVzdF9pZDogYTkyNmI5MzctMmNlNC00MmNlLTkxMmQtNWU5MjIyNDY2YTVjKSIsInR5cGUiOiJhdXRoZW50aWNhdGlvbl9lcnJvciIsInBhcmFtIjpudWxsLCJjb2RlIjoiaW52YWxpZF9yZXF1ZXN0X2Vycm9yIn19"
+      }
+    }
+  ]
+}

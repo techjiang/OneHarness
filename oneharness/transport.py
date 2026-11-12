@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import time
 import urllib.error
@@ -9,6 +10,7 @@ import urllib.request
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from oneharness import tape as tape_module
 from oneharness.errors import ProviderError
 
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
@@ -33,6 +35,10 @@ def post_json(
     sign: Signer | None = None,
 ) -> dict[str, Any]:
     """POST JSON and return the decoded response, retrying transient failures."""
+    tape = tape_module.active()
+    if tape is not None and tape.replaying:
+        return _decode(_replayed(tape, url, payload))
+
     body = json.dumps(payload).encode("utf-8")
     base_headers = {"content-type": "application/json", "accept": "application/json"}
     base_headers.update(headers or {})
@@ -43,20 +49,26 @@ def post_json(
         request = urllib.request.Request(url, data=body, headers=headers_to_send, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return _decode(response.read())
+                raw = response.read()
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
             last_error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
             if exc.code not in RETRY_STATUS or attempt == retries:
+                _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise last_error from None
         except urllib.error.URLError as exc:
             last_error = ProviderError(f"cannot reach {url}: {exc.reason}")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(last_error).encode("utf-8"))
                 raise last_error from None
         except TimeoutError:
             last_error = ProviderError(f"request to {url} timed out after {timeout}s")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(last_error).encode("utf-8"))
                 raise last_error from None
+        else:
+            _record(tape, url, payload, 200, raw)
+            return _decode(raw)
         time.sleep(backoff * (2**attempt))
 
     raise last_error or ProviderError(f"request to {url} failed")
@@ -89,6 +101,11 @@ def post_sse(
     Retries only apply while nothing has been yielded yet: once the caller has
     seen a token, replaying the request would duplicate output.
     """
+    tape = tape_module.active()
+    if tape is not None and tape.replaying:
+        yield from _read_events(io.BytesIO(_replayed(tape, url, payload)))
+        return
+
     body = json.dumps(payload).encode("utf-8")
     base_headers = {"content-type": "application/json", "accept": "text/event-stream"}
     base_headers.update(headers or {})
@@ -103,18 +120,25 @@ def post_sse(
             text = exc.read().decode("utf-8", "replace")
             error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
             if exc.code not in RETRY_STATUS or attempt == retries:
+                _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise error from None
         except urllib.error.URLError as exc:
             error = ProviderError(f"cannot reach {url}: {exc.reason}")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         except TimeoutError:
             error = ProviderError(f"request to {url} timed out after {timeout}s")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         else:
+            # The raw bytes are collected on the way through: a tape has to
+            # hold what the server sent, not what this parser made of it.
+            sink: list[bytes] = []
             with response:
-                yield from _read_events(response)
+                yield from _read_events(_tee(response, sink))
+            _record(tape, url, payload, 200, b"".join(sink))
             return
         attempt += 1
         time.sleep(backoff * (2**attempt))
@@ -137,6 +161,15 @@ def post_chunks(
     has no line structure at all, so the transport must be able to hand over
     bytes and let the format decide how to frame them.
     """
+    tape = tape_module.active()
+    if tape is not None and tape.replaying:
+        body = _replayed(tape, url, payload)
+        # Sliced, not handed over whole: a chunk consumer that only works when
+        # everything arrives at once is exactly what this path must catch.
+        for start in range(0, len(body), 4096):
+            yield body[start : start + 4096]
+        return
+
     body = json.dumps(payload).encode("utf-8")
     base_headers = {"content-type": "application/json", "accept": accept}
     base_headers.update(headers or {})
@@ -151,16 +184,20 @@ def post_chunks(
             text = exc.read().decode("utf-8", "replace")
             error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
             if exc.code not in RETRY_STATUS or attempt == retries:
+                _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise error from None
         except urllib.error.URLError as exc:
             error = ProviderError(f"cannot reach {url}: {exc.reason}")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         except TimeoutError:
             error = ProviderError(f"request to {url} timed out after {timeout}s")
             if attempt == retries:
+                _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         else:
+            sink = []
             with response:
                 # `read(4096)` blocks until the buffer is full or the body ends,
                 # so it would hand a whole stream over at once at the end --
@@ -171,7 +208,9 @@ def post_chunks(
                 while True:
                     chunk = reader(4096)
                     if not chunk:
+                        _record(tape, url, payload, 200, b"".join(sink))
                         return
+                    sink.append(chunk)
                     yield chunk
         attempt += 1
         time.sleep(backoff * (2**attempt))
@@ -216,3 +255,37 @@ def _read_events(stream: Any) -> Iterator[tuple[str | None, dict[str, Any]]]:
                 return
             if isinstance(decoded, dict):
                 yield (event_name, decoded)
+
+
+def _tee(stream: Any, sink: list[bytes]) -> Iterator[bytes]:
+    """Iterate `stream` while remembering every raw line for the tape."""
+    for raw in stream:
+        sink.append(raw)
+        yield raw
+
+
+def _record(
+    tape: tape_module.Tape | None,
+    url: str,
+    payload: dict[str, Any],
+    status: int,
+    body: bytes,
+) -> None:
+    if tape is not None:
+        tape.store(url, payload, status, body)
+
+
+def _replayed(tape: tape_module.Tape, url: str, payload: dict[str, Any]) -> bytes:
+    """The recorded body for this request, or the recorded failure re-raised.
+
+    A replayed error keeps its status and body so a test can assert on what the
+    provider actually said, not on a paraphrase of it.
+    """
+    status, body = tape.exchange(url, payload)
+    if status == 0:
+        raise ProviderError(body.decode("utf-8", "replace"))
+    if status != 200:
+        raise ProviderError(
+            f"request to {url} failed", status=status, body=body.decode("utf-8", "replace")
+        )
+    return body

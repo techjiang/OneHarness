@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from oneharness import __version__
+from oneharness import doctor as doctor_module
 from oneharness.agent import Agent, AgentResult
 from oneharness.builtin import default_tools
 from oneharness.config import Config, McpServerConfig, load_config
@@ -18,6 +19,7 @@ from oneharness.delegate import Delegator
 from oneharness.errors import ConfigError, OneHarnessError
 from oneharness.mcp import McpClient, McpError
 from oneharness.providers import create_provider, list_presets, preset_defaults
+from oneharness.tape import Tape
 from oneharness.tools import Registry, Tool
 from oneharness.types import Message
 
@@ -54,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="expose `delegate` / `delegate_many` tools that hand work to sub agents",
         )
+        sub.add_argument(
+            "--record",
+            metavar="PATH",
+            help="write every provider exchange of this run to a tape file",
+        )
+        sub.add_argument(
+            "--replay",
+            metavar="PATH",
+            help="answer provider requests from a tape instead of the network (no key needed)",
+        )
         sub.add_argument("--json", action="store_true", help="emit machine-readable JSON")
         sub.add_argument("--quiet", action="store_true", help="hide progress events")
         sub.add_argument("--stream", action="store_true", help="print tokens as they arrive")
@@ -74,6 +86,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("tools", help="list the built-in tool names")
     subparsers.add_parser("presets", help="list provider presets and their default endpoints")
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="send one real minimal request per provider and classify the answer",
+    )
+    doctor.add_argument(
+        "providers",
+        nargs="*",
+        metavar="PRESET",
+        help="presets to check; default is every preset with credentials present",
+    )
+    doctor.add_argument(
+        "--all", action="store_true", help="check every preset, not only the configured ones"
+    )
+    doctor.add_argument("--timeout", type=float, default=20.0, help="seconds per request")
+    doctor.add_argument(
+        "-m", "--model", help="override the model/deployment name for every preset checked"
+    )
+    doctor.add_argument("--base-url", help="override the endpoint for every preset checked")
+    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    doctor.add_argument("--record", metavar="PATH", help="save the exchanges to a tape file")
+    doctor.add_argument(
+        "--replay",
+        metavar="PATH",
+        help="classify a recorded exchange instead of asking the network",
+    )
 
     config_cmd = subparsers.add_parser("config", help="print the resolved configuration")
     config_cmd.add_argument("-c", "--config", help="path to oneharness.toml")
@@ -309,16 +347,19 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _resolve_config(args)
     stream = args.stream and not args.json
     observer = _printer(args.quiet, stream)
-    tools, clients = _with_mcp(args, config, observer)
-    try:
-        agent, delegator = _build_agent(args, config, observer, tools)
-        result = agent.run(" ".join(args.prompt), stream=stream)
-    finally:
-        for client in clients:
-            client.close()
+    with _tape(args) as tape:
+        tools, clients = _with_mcp(args, config, observer)
+        try:
+            agent, delegator = _build_agent(args, config, observer, tools)
+            result = agent.run(" ".join(args.prompt), stream=stream)
+        finally:
+            for client in clients:
+                client.close()
     delegation = delegator.as_dict() if delegator is not None and delegator.runs else None
     _report(result, args.json, stream, delegation)
     _report_delegation(delegator, args.quiet)
+    if tape is not None and not args.quiet:
+        _report_tape(tape)
     return EXIT_OK if result.ok else EXIT_ERROR
 
 
@@ -326,6 +367,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
     config = _resolve_config(args)
     stream = args.stream
     observer = _printer(args.quiet, stream)
+    with _tape(args):
+        return _chat(args, config, observer, stream)
+
+
+def _chat(args: argparse.Namespace, config: Config, observer, stream: bool) -> int:
     tools, clients = _with_mcp(args, config, observer)
     history: list[Message] = []
 
@@ -386,12 +432,92 @@ def cmd_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _tape(args: argparse.Namespace) -> Tape:
+    """`--record` / `--replay`, or a no-op that installs nothing.
+
+    Replay is the reason this exists as a context manager: a recorded run can be
+    replayed on a machine with no keys and no network, and the provider code
+    path is byte-for-byte the one that talked to the real endpoint.
+    """
+    record = getattr(args, "record", None)
+    replay = getattr(args, "replay", None)
+    if record and replay:
+        raise ConfigError("--record and --replay are different runs; pick one")
+    if replay:
+        return Tape.replay(replay)
+    if record:
+        return Tape.record(record)
+    return _NullTape()
+
+
+class _NullTape:
+    """Stands in for `Tape` when the flag was not given, without installing."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+def _report_tape(tape: Tape) -> None:
+    """One line on stderr: a tape is a side effect, the answer is the product."""
+    if tape.replaying:
+        print(f"[replayed {tape.matched} exchange(s) from {tape.path}]", file=sys.stderr)
+    else:
+        print(f"[recorded {tape.recorded} exchange(s) to {tape.path}]", file=sys.stderr)
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    names = list(args.providers)
+    if not names:
+        names = list_presets() if args.all else doctor_module.configured_presets() or list_presets()
+    unknown = [name for name in names if name not in list_presets()]
+    if unknown:
+        raise ConfigError(
+            f"unknown provider(s): {', '.join(unknown)}; known: {', '.join(list_presets())}"
+        )
+
+    overrides = {
+        key: value for key, value in (("model", args.model), ("base_url", args.base_url)) if value
+    }
+    with _tape(args):
+        probes = doctor_module.check_many(names, timeout=args.timeout, **overrides)
+
+    if args.json:
+        print(json.dumps([probe.as_dict() for probe in probes], indent=2, ensure_ascii=False))
+    else:
+        _print_probes(probes)
+    return EXIT_ERROR if any(probe.failed for probe in probes) else EXIT_OK
+
+
+def _print_probes(probes: Sequence[doctor_module.Probe]) -> None:
+    """A table on stdout: this is the whole product, so it is not stderr chatter."""
+    width = max(len(probe.preset) for probe in probes)
+    marks = {
+        doctor_module.OK: "✓",
+        doctor_module.AUTH: "✗",
+        doctor_module.MODEL: "✗",
+        doctor_module.ENDPOINT: "✗",
+        doctor_module.QUOTA: "!",
+        doctor_module.PROTOCOL: "✗",
+        doctor_module.NETWORK: "✗",
+        doctor_module.UNCONFIGURED: "-",
+    }
+    for probe in probes:
+        mark = marks.get(probe.status, "?")
+        print(f"{mark} {probe.preset:<{width}}  {probe.status:<12} {probe.detail}")
+        if probe.status != doctor_module.OK and probe.hint:
+            print(f"  {'':<{width}}  {probe.hint}")
+
+
 COMMANDS = {
     "run": cmd_run,
     "chat": cmd_chat,
     "tools": cmd_tools,
     "presets": cmd_presets,
     "config": cmd_config,
+    "doctor": cmd_doctor,
 }
 
 

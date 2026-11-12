@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hint": "recorded from a real endpoint; headers are deliberately absent",
+  "entries": [
+    {
+      "url": "https://api.groq.com/openai/v1/chat/completions",
+      "request": {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+          {
+            "role": "user",
+            "content": "ping"
+          }
+        ],
+        "temperature": 0.0
+      },
+      "response": {
+        "status": 403,
+        "body_b64": "eyJlcnJvciI6eyJtZXNzYWdlIjoiRm9yYmlkZGVuIn19"
+      }
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hint": "recorded from a real endpoint; headers are deliberately absent",
+  "entries": [
+    {
+      "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+      "request": {
+        "model": "gemini-2.0-flash",
+        "messages": [
+          {
+            "role": "user",
+            "content": "ping"
+          }
+        ],
+        "temperature": 0.0
+      },
+      "response": {
+        "status": 400,
+        "body_b64": "ewogICJlcnJvciI6IHsKICAgICJjb2RlIjogNDAwLAogICAgIm1lc3NhZ2UiOiAiSW52YWxpZCBKU09OIHBheWxvYWQgcmVjZWl2ZWQuIFVua25vd24gbmFtZSBcIm1lc3NhZ2VzXCI6IENhbm5vdCBmaW5kIGZpZWxkLlxuSW52YWxpZCBKU09OIHBheWxvYWQgcmVjZWl2ZWQuIFVua25vd24gbmFtZSBcInRlbXBlcmF0dXJlXCI6IENhbm5vdCBmaW5kIGZpZWxkLiIsCiAgICAic3RhdHVzIjogIklOVkFMSURfQVJHVU1FTlQiLAogICAgImRldGFpbHMiOiBbCiAgICAgIHsKICAgICAgICAiQHR5cGUiOiAidHlwZS5nb29nbGVhcGlzLmNvbS9nb29nbGUucnBjLkJhZFJlcXVlc3QiLAogICAgICAgICJmaWVsZFZpb2xhdGlvbnMiOiBbCiAgICAgICAgICB7CiAgICAgICAgICAgICJkZXNjcmlwdGlvbiI6ICJJbnZhbGlkIEpTT04gcGF5bG9hZCByZWNlaXZlZC4gVW5rbm93biBuYW1lIFwibWVzc2FnZXNcIjogQ2Fubm90IGZpbmQgZmllbGQuIgogICAgICAgICAgfSwKICAgICAgICAgIHsKICAgICAgICAgICAgImRlc2NyaXB0aW9uIjogIkludmFsaWQgSlNPTiBwYXlsb2FkIHJlY2VpdmVkLiBVbmtub3duIG5hbWUgXCJ0ZW1wZXJhdHVyZVwiOiBDYW5ub3QgZmluZCBmaWVsZC4iCiAgICAgICAgICB9CiAgICAgICAgXQogICAgICB9CiAgICBdCiAgfQp9Cg=="
+      }
+    }
+  ]
+}

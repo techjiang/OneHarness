@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from oneharness import tape as tape_module
 from oneharness.errors import ConfigError
 from oneharness.providers.anthropic import AnthropicProvider
 from oneharness.providers.azure import AzureOpenAIProvider
@@ -126,6 +127,12 @@ def preset_defaults(preset: str) -> dict[str, str]:
     }
 
 
+def _replaying() -> bool:
+    """True when the transport is answering from a tape, so no key can be used."""
+    tape = tape_module.active()
+    return tape is not None and tape.replaying
+
+
 def aws_credentials() -> Credentials:
     """Credentials from the standard AWS environment variables.
 
@@ -135,6 +142,11 @@ def aws_credentials() -> Credentials:
     """
     access_key = os.environ.get("AWS_ACCESS_KEY_ID")
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if (not access_key or not secret_key) and _replaying():
+        # A replay never reaches AWS, so the credentials it signs with cannot
+        # matter. Demanding them would make "replay a tape on a clean machine"
+        # require the very secrets the tape exists to replace.
+        return Credentials(access_key="AKIAOFFLINE00000000", secret_key="offline-replay-only")
     if not access_key or not secret_key:
         raise ConfigError(
             "no AWS credentials for provider 'bedrock'; set AWS_ACCESS_KEY_ID and "
@@ -170,6 +182,8 @@ def create_provider(preset: str, **options: Any) -> Provider:
             if os.environ.get(env_name):
                 api_key = os.environ[env_name]
                 break
+    if api_key is None and spec["env"] and _replaying():
+        api_key = "replay-not-needed"
     if api_key is None:
         if spec["env"]:
             raise ConfigError(
