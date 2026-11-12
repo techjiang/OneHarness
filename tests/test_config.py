@@ -7,14 +7,80 @@ from oneharness.config import Config, find_config_file, load_config
 from oneharness.errors import ConfigError
 
 
+class McpConfigTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def write(self, text):
+        path = self.root / "oneharness.toml"
+        path.write_text(text)
+        return path
+
+    def test_single_server_table(self):
+        path = self.write(
+            """
+            [[mcp]]
+            command = ["npx", "-y", "server-filesystem", "/tmp"]
+            prefix = "fs."
+            timeout = 12
+            """
+        )
+        config = load_config(path)
+        self.assertEqual(len(config.mcp), 1)
+        server = config.mcp[0]
+        self.assertEqual(server.command, ["npx", "-y", "server-filesystem", "/tmp"])
+        self.assertEqual(server.prefix, "fs.")
+        self.assertEqual(server.timeout, 12)
+        self.assertEqual(config.as_dict()["mcp"][0]["prefix"], "fs.")
+
+    def test_command_may_be_a_string(self):
+        path = self.write(
+            """
+            [[mcp]]
+            command = "python3 -m my_server"
+            """
+        )
+        config = load_config(path)
+        self.assertEqual(config.mcp[0].command, ["python3", "-m", "my_server"])
+
+    def test_unknown_keys_rejected(self):
+        path = self.write(
+            """
+            [[mcp]]
+            command = ["x"]
+            nope = 1
+            """
+        )
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(path)
+        self.assertIn("unknown mcp[0] keys", str(ctx.exception))
+
+    def test_missing_command_rejected(self):
+        path = self.write(
+            """
+            [[mcp]]
+            prefix = "fs."
+            """
+        )
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_mcp_must_be_a_table_array(self):
+        path = self.write('mcp = "nope"\n')
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self._saved_env = {
-            k: os.environ.pop(k)
-            for k in list(os.environ)
-            if k.startswith("ONEHARNESS_")
+            k: os.environ.pop(k) for k in list(os.environ) if k.startswith("ONEHARNESS_")
         }
 
     def tearDown(self):

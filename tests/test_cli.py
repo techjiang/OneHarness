@@ -100,6 +100,64 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("without a final answer", err)
 
+    def test_presets_command_lists_providers(self):
+        code, out, _ = run_cli(["presets"])
+        self.assertEqual(code, 0)
+        self.assertIn("gemini", out)
+        self.assertIn("openrouter", out)
+
+    def test_stream_flag_exposes_text_deltas(self):
+        """`--stream` must print the final text once, not twice."""
+
+        class StreamingProvider:
+            name = "fake"
+            model = "fake-1"
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("stream mode must not call complete()")
+
+            def stream(self, messages, tools=None):
+                from oneharness.types import StreamEvent
+
+                yield StreamEvent(kind="text", text="po")
+                yield StreamEvent(kind="text", text="ng")
+                yield StreamEvent(
+                    kind="done", completion=Completion(message=Message.assistant("pong"))
+                )
+
+        with mock.patch.object(cli, "create_provider", return_value=StreamingProvider()):
+            code, out, _ = run_cli(["run", "ping", "--stream", "--workspace", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("pong"), 1)
+
+    def test_mcp_server_receives_tools(self):
+        from tests.test_mcp import SERVER
+
+        seen = {}
+
+        class RecordingProvider:
+            name = "fake"
+            model = "fake-1"
+
+            def complete(self, messages, tools=None):
+                seen["tools"] = [spec["name"] for spec in tools or ()]
+                return Completion(message=Message.assistant("ok"))
+
+        with mock.patch.object(cli, "create_provider", return_value=RecordingProvider()):
+            code, out, _ = run_cli(
+                ["run", "go", "--quiet", "--workspace", str(self.root), "--mcp", " ".join(SERVER)]
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "ok")
+        self.assertIn("echo", seen["tools"])
+
+    def test_broken_mcp_command_exits_nonzero(self):
+        code, _, err = run_cli(
+            ["run", "go", "--quiet", "--workspace", str(self.root), "--mcp", "no-such-binary-xyz"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("MCP", err)
+
     def test_parse_error_for_unknown_flag(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
             cli.main(["run", "hi", "--nope"])

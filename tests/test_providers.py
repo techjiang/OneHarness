@@ -135,9 +135,7 @@ class OpenAIProviderTests(unittest.TestCase):
             self.assertEqual(server.requests[0]["body"]["tools"][0]["type"], "function")
 
             # the assistant turn plus a tool result must encode cleanly
-            encoded = provider._encode(
-                Message.assistant("", completion.tool_calls)
-            )
+            encoded = provider._encode(Message.assistant("", completion.tool_calls))
             self.assertIsNone(encoded["content"])
             self.assertEqual(encoded["tool_calls"][0]["function"]["arguments"], '{"a":1,"b":2}')
 
@@ -171,9 +169,7 @@ class AnthropicProviderTests(unittest.TestCase):
     def test_system_hoisted_and_text(self):
         with Recorder(self.reply([{"type": "text", "text": "hey"}])) as server:
             provider = AnthropicProvider("claude-test", api_key="k", base_url=server.url)
-            completion = provider.complete(
-                [Message.system("be terse"), Message.user("hello")]
-            )
+            completion = provider.complete([Message.system("be terse"), Message.user("hello")])
         self.assertEqual(completion.text, "hey")
         self.assertEqual(completion.usage.input_tokens, 7)
         body = server.requests[0]["body"]
@@ -198,9 +194,7 @@ class AnthropicProviderTests(unittest.TestCase):
             )
         self.assertEqual(completion.text, "let me check")
         self.assertEqual(completion.tool_calls[0].arguments, {"a": 1, "b": 2})
-        self.assertEqual(
-            server.requests[0]["body"]["tools"][0]["input_schema"], {"type": "object"}
-        )
+        self.assertEqual(server.requests[0]["body"]["tools"][0]["input_schema"], {"type": "object"})
 
         _, turns = provider._split(
             [

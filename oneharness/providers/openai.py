@@ -6,13 +6,13 @@ llama.cpp servers, so one adapter covers all of them via `base_url`.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
-from oneharness.transport import post_json
-from oneharness.types import Completion, Message, ToolCall, Usage
+from oneharness.transport import post_json, post_sse
+from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
 
 
 class OpenAIProvider(Provider):
@@ -42,6 +42,92 @@ class OpenAIProvider(Provider):
         messages: Sequence[Message],
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> Completion:
+        data = post_json(
+            self._endpoint(), self._payload(messages, tools), self._headers(), timeout=self.timeout
+        )
+        return self._decode(data)
+
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]] | None = None,
+    ) -> Iterator[StreamEvent]:
+        payload = self._payload(messages, tools)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+
+        text: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        model = self.model
+        stop_reason = None
+        usage = Usage()
+
+        for _, chunk in post_sse(self._endpoint(), payload, self._headers(), timeout=self.timeout):
+            if chunk.get("usage"):
+                usage = Usage(
+                    input_tokens=int(chunk["usage"].get("prompt_tokens") or 0),
+                    output_tokens=int(chunk["usage"].get("completion_tokens") or 0),
+                )
+            model = chunk.get("model") or model
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0] or {}
+            stop_reason = choice.get("finish_reason") or stop_reason
+            delta = choice.get("delta") or {}
+
+            piece = delta.get("content")
+            if piece:
+                text.append(piece)
+                yield StreamEvent(kind="text", text=piece)
+
+            for raw in delta.get("tool_calls") or ():
+                slot = calls.setdefault(
+                    int(raw.get("index", len(calls))), {"id": "", "name": "", "arguments": ""}
+                )
+                if raw.get("id"):
+                    slot["id"] = raw["id"]
+                function = raw.get("function") or {}
+                if function.get("name"):
+                    slot["name"] = function["name"]
+                if function.get("arguments"):
+                    slot["arguments"] += function["arguments"]
+
+        message = Message.assistant(
+            "".join(text),
+            [
+                ToolCall.from_raw(
+                    call_id=slot["id"] or f"call_{index}",
+                    name=slot["name"],
+                    arguments=slot["arguments"] or "{}",
+                )
+                for index, slot in sorted(calls.items())
+            ],
+        )
+        yield StreamEvent(
+            kind="done",
+            completion=Completion(
+                message=message,
+                usage=usage,
+                model=model,
+                stop_reason=stop_reason,
+                raw={"streamed": True},
+            ),
+        )
+
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/chat/completions"
+
+    def _headers(self) -> dict[str, str]:
+        headers = {"authorization": f"Bearer {self.api_key}"}
+        headers.update(self.extra_headers)
+        return headers
+
+    def _payload(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [self._encode(m) for m in messages],
@@ -51,15 +137,8 @@ class OpenAIProvider(Provider):
             payload["max_tokens"] = self.max_tokens
         if tools:
             payload["tools"] = [{"type": "function", "function": dict(t)} for t in tools]
-
         payload.update(self.extra_body)
-        headers = {"authorization": f"Bearer {self.api_key}"}
-        headers.update(self.extra_headers)
-
-        data = post_json(
-            f"{self.base_url}/chat/completions", payload, headers, timeout=self.timeout
-        )
-        return self._decode(data)
+        return payload
 
     def _encode(self, message: Message) -> dict[str, Any]:
         if message.role == "tool":

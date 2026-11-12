@@ -140,6 +140,20 @@ class Completion:
 
 
 @dataclass(slots=True)
+class StreamEvent:
+    """One step of a streamed response.
+
+    Providers yield `text` events as tokens arrive and exactly one `done`
+    event carrying the assembled Completion, so the agent loop has a single
+    place to pick the finished turn up from.
+    """
+
+    kind: Literal["text", "done"]
+    text: str = ""
+    completion: Completion | None = None
+
+
+@dataclass(slots=True)
 class ToolResult:
     tool_call_id: str
     name: str

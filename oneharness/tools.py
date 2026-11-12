@@ -42,6 +42,7 @@ def tool(
     description: str | None = None,
 ) -> Any:
     """Turn a function into a Tool, deriving the argument schema from its signature."""
+
     def wrap(func: Callable[..., Any]) -> Tool:
         tool_name = name or func.__name__
         if not _NAME.match(tool_name):

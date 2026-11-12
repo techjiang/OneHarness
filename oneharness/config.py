@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,10 +43,29 @@ class ProviderConfig:
 
 
 @dataclass(slots=True)
+class McpServerConfig:
+    """One MCP server to spawn and borrow tools from."""
+
+    command: list[str] = field(default_factory=list)
+    prefix: str = ""
+    cwd: str | None = None
+    timeout: float = 30.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "command": list(self.command),
+            "prefix": self.prefix,
+            "cwd": self.cwd,
+            "timeout": self.timeout,
+        }
+
+
+@dataclass(slots=True)
 class Config:
     provider: ProviderConfig = field(default_factory=ProviderConfig)
     system: str | None = None
     max_steps: int = 8
+    mcp: list[McpServerConfig] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +78,7 @@ class Config:
             },
             "system": self.system,
             "max_steps": self.max_steps,
+            "mcp": [server.as_dict() for server in self.mcp],
         }
 
 
@@ -91,7 +112,7 @@ def _read_toml(path: Path) -> dict[str, Any]:
             data = tomllib.load(handle)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
-    unknown = set(data) - {"provider", "system", "max_steps", "agent"}
+    unknown = set(data) - {"provider", "system", "max_steps", "agent", "mcp"}
     if unknown:
         raise ConfigError(f"{path} has unknown sections: {', '.join(sorted(unknown))}")
     return data
@@ -119,7 +140,38 @@ def _merge(config: Config, data: dict[str, Any]) -> Config:
             config.system = agent_data["system"]
         if "max_steps" in agent_data:
             config.max_steps = int(agent_data["max_steps"])
+
+    config.mcp = _read_mcp(data.get("mcp") or [])
     return config
+
+
+def _read_mcp(entries: Any) -> list[McpServerConfig]:
+    """`[[mcp]]` tables: each one spawns a server via `command`."""
+    if not isinstance(entries, list):
+        raise ConfigError("mcp must be an array of tables ([[mcp]])")
+
+    servers: list[McpServerConfig] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ConfigError(f"mcp[{index}] must be a table")
+        unknown = set(entry) - set(McpServerConfig.__slots__)
+        if unknown:
+            raise ConfigError(f"unknown mcp[{index}] keys: {', '.join(sorted(unknown))}")
+
+        command = entry.get("command")
+        if isinstance(command, str):
+            command = shlex.split(command)
+        if not isinstance(command, list) or not command:
+            raise ConfigError(f"mcp[{index}] needs a non-empty command list")
+        servers.append(
+            McpServerConfig(
+                command=[str(part) for part in command],
+                prefix=str(entry.get("prefix") or ""),
+                cwd=entry.get("cwd"),
+                timeout=float(entry.get("timeout") or 30.0),
+            )
+        )
+    return servers
 
 
 def _apply_env(config: Config) -> Config:

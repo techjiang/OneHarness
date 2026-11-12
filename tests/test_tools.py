@@ -72,6 +72,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_invalid_name_rejected(self):
         with self.assertRaises(ToolError):
+
             @tool(name="bad name!")
             def broken() -> str:
                 return ""

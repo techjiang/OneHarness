@@ -8,8 +8,16 @@ main:
               script: |
                 python -m pip install --quiet --upgrade pip
                 python -m unittest discover -s tests -v
-            - name: e2e demo
-              script: python examples/e2e_demo.py
+            - name: lint
+              script: |
+                python -m pip install --quiet ruff
+                ruff check oneharness tests examples
+                ruff format --check oneharness tests examples
+            - name: demos
+              script: |
+                python examples/e2e_demo.py
+                python examples/stream_demo.py
+                python examples/mcp_demo.py
 
   pull_request:
     - stages:
@@ -18,3 +26,8 @@ main:
           jobs:
             - name: unit tests
               script: python -m unittest discover -s tests -v
+            - name: lint
+              script: |
+                python -m pip install --quiet ruff
+                ruff check oneharness tests examples
+                ruff format --check oneharness tests examples

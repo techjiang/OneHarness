@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
-from oneharness.types import Completion, Message
+from oneharness.types import Completion, Message, StreamEvent
 
 
 class Provider(abc.ABC):
@@ -28,3 +28,19 @@ class Provider(abc.ABC):
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> Completion:
         """Send one request and normalise the reply into a Completion."""
+
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Sequence[dict[str, Any]] | None = None,
+    ) -> Iterator[StreamEvent]:
+        """Stream a reply as text deltas plus one final Completion.
+
+        The default implementation cheats: it does the blocking request and
+        yields the whole answer in one delta, so `--stream` still works on a
+        provider that has not implemented real streaming.
+        """
+        completion = self.complete(messages, tools)
+        if completion.text:
+            yield StreamEvent(kind="text", text=completion.text)
+        yield StreamEvent(kind="done", completion=completion)

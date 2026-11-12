@@ -1,10 +1,11 @@
+import io
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from oneharness.errors import ProviderError
-from oneharness.transport import post_json
+from oneharness.transport import _read_events, post_json
 
 
 class FlakyServer:
@@ -75,9 +76,10 @@ class TransportTests(unittest.TestCase):
         self.assertIn("cannot reach", str(ctx.exception))
 
     def test_non_json_body(self):
-        with FlakyServer([], body=b"<html>nope</html>") as server, self.assertRaises(
-            ProviderError
-        ) as ctx:
+        with (
+            FlakyServer([], body=b"<html>nope</html>") as server,
+            self.assertRaises(ProviderError) as ctx,
+        ):
             post_json(server.url, {})
         self.assertIn("not JSON", str(ctx.exception))
 
@@ -90,6 +92,36 @@ class TransportTests(unittest.TestCase):
         with FlakyServer([], delay=0.5) as server, self.assertRaises(ProviderError) as ctx:
             post_json(server.url, {}, timeout=0.1, retries=0)
         self.assertIn("timed out", str(ctx.exception))
+
+
+class SseParsingTests(unittest.TestCase):
+    def parse(self, text):
+        stream = io.BytesIO(text.encode("utf-8"))
+        return list(_read_events(stream))
+
+    def test_comments_and_blank_lines_are_skipped(self):
+        events = self.parse(': keepalive\n\ndata: {"a":1}\n\n')
+        self.assertEqual(events, [(None, {"a": 1})])
+
+    def test_named_event(self):
+        events = self.parse('event: ping\ndata: {"x":2}\n\n')
+        self.assertEqual(events[0][0], "ping")
+
+    def test_done_sentinel(self):
+        events = self.parse('data: {"a":1}\n\ndata: [DONE]\n\n')
+        self.assertEqual(events[-1], ("done", {}))
+
+    def test_multiline_data_is_joined(self):
+        events = self.parse('data: {"a":\ndata: 1}\n\n')
+        self.assertEqual(events[0][1], {"a": 1})
+
+    def test_trailing_frame_without_blank_line(self):
+        events = self.parse('data: {"a":3}')
+        self.assertEqual(events, [(None, {"a": 3})])
+
+    def test_bad_json_raises(self):
+        with self.assertRaises(ProviderError):
+            self.parse("data: not json\n\n")
 
 
 if __name__ == "__main__":

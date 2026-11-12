@@ -4,7 +4,7 @@ from oneharness.agent import Agent
 from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.tools import tool
-from oneharness.types import Completion, Message, ToolCall, Usage
+from oneharness.types import Completion, Message, StreamEvent, ToolCall, Usage
 
 
 class ScriptedProvider(Provider):
@@ -86,9 +86,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(roles[:4], ["system", "user", "assistant", "user"])
 
     def test_bad_tool_arguments_are_fed_back(self):
-        provider = ScriptedProvider(
-            tool_reply("add", '{"a": "x"}'), text_reply("sorry, retrying")
-        )
+        provider = ScriptedProvider(tool_reply("add", '{"a": "x"}'), text_reply("sorry, retrying"))
         result = Agent(provider, [add]).run("2+3?")
         first = result.steps[0].tool_results[0]
         self.assertTrue(first.is_error)
@@ -144,6 +142,62 @@ class AgentLoopTests(unittest.TestCase):
             kinds, ["step_start", "assistant", "tool_start", "tool_end", "step_start", "assistant"]
         )
         self.assertEqual(events[2]["name"], "add")
+
+    def test_stream_mode_emits_deltas_and_keeps_result_shape(self):
+        class StreamingProvider(Provider):
+            name = "streamy"
+
+            def __init__(self):
+                super().__init__(model="m")
+                self.rounds = 0
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("stream mode must not call complete()")
+
+            def stream(self, messages, tools=None):
+                self.rounds += 1
+                if self.rounds == 1:
+                    call = ToolCall.from_raw(call_id="c1", name="add", arguments={"a": 2, "b": 3})
+                    for piece in ("let me ", "add"):
+                        yield StreamEvent(kind="text", text=piece)
+                    yield StreamEvent(
+                        kind="done",
+                        completion=Completion(message=Message.assistant("", [call])),
+                    )
+                    return
+                yield StreamEvent(kind="text", text="it is ")
+                yield StreamEvent(kind="text", text="5")
+                yield StreamEvent(kind="done", completion=Completion(message=Message.assistant("")))
+
+        events = []
+        result = Agent(StreamingProvider(), [add], on_event=events.append).run("2+3?", stream=True)
+
+        self.assertEqual(result.text, "it is 5")
+        self.assertEqual(result.stopped_reason, "done")
+        self.assertEqual(result.steps[0].tool_results[0].content, "5")
+        deltas = [e["text"] for e in events if e["type"] == "text_delta"]
+        self.assertEqual("".join(deltas), "let me addit is 5")
+
+    def test_stream_mode_reports_missing_completion(self):
+        class Mute(Provider):
+            name = "mute"
+
+            def complete(self, messages, tools=None):
+                raise AssertionError("unused")
+
+            def stream(self, messages, tools=None):
+                yield StreamEvent(kind="text", text="half")
+
+        with self.assertRaises(ProviderError):
+            Agent(Mute("m")).run("hi", stream=True)
+
+    def test_default_stream_falls_back_to_complete(self):
+        """A provider without real streaming still works under --stream."""
+        provider = ScriptedProvider(text_reply("pong"))
+        events = []
+        result = Agent(provider, on_event=events.append).run("ping", stream=True)
+        self.assertEqual(result.text, "pong")
+        self.assertEqual([e["text"] for e in events if e["type"] == "text_delta"], ["pong"])
 
     def test_result_serialises(self):
         provider = ScriptedProvider(tool_reply("add", '{"a": 1, "b": 2}'), text_reply("3"))

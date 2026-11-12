@@ -6,7 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from oneharness.errors import OneHarnessError, ProviderError
+from oneharness.errors import ProviderError
 from oneharness.providers.base import Provider
 from oneharness.tools import Registry
 from oneharness.types import Completion, Message, ToolResult, Usage
@@ -80,14 +80,20 @@ class Agent:
         self.max_steps = max_steps
         self.on_event = on_event
 
-    def run(self, prompt: str, *, history: Sequence[Message] | None = None) -> AgentResult:
-        messages: list[Message] = []
-        if self.system:
-            messages.append(Message.system(self.system))
-        messages.extend(history or ())
-        if prompt:
-            messages.append(Message.user(prompt))
+    def run(
+        self,
+        prompt: str,
+        *,
+        history: Sequence[Message] | None = None,
+        stream: bool = False,
+    ) -> AgentResult:
+        """Drive the loop to completion; `stream=True` also emits text deltas.
 
+        Streaming does not change the result shape: token events go out through
+        `on_event` as they arrive, and the loop still works on a finished
+        Completion, so a mid-run tool call behaves exactly as before.
+        """
+        messages = self._seed(prompt, history)
         specs = self.tools.specs()
         steps: list[Step] = []
         total = Usage()
@@ -96,12 +102,7 @@ class Agent:
 
         for index in range(self.max_steps):
             self._emit({"type": "step_start", "step": index + 1})
-            try:
-                completion = self.provider.complete(messages, specs)
-            except ProviderError:
-                raise
-            except OneHarnessError:
-                raise
+            completion = self._complete(messages, specs, stream=stream, step=index + 1)
 
             total = total + completion.usage
             messages.append(completion.message)
@@ -149,6 +150,40 @@ class Agent:
             stopped_reason=stopped,
             model=getattr(self.provider, "model", None),
         )
+
+    def _seed(self, prompt: str, history: Sequence[Message] | None) -> list[Message]:
+        messages: list[Message] = []
+        if self.system:
+            messages.append(Message.system(self.system))
+        messages.extend(history or ())
+        if prompt:
+            messages.append(Message.user(prompt))
+        return messages
+
+    def _complete(
+        self,
+        messages: list[Message],
+        specs: Sequence[dict[str, Any]],
+        *,
+        stream: bool,
+        step: int,
+    ) -> Completion:
+        if not stream:
+            return self.provider.complete(messages, specs)
+
+        text: list[str] = []
+        finished: Completion | None = None
+        for event in self.provider.stream(messages, specs):
+            if event.kind == "text":
+                text.append(event.text)
+                self._emit({"type": "text_delta", "step": step, "text": event.text})
+            elif event.completion is not None:
+                finished = event.completion
+        if finished is None:
+            raise ProviderError("stream ended without a final completion")
+        if not finished.message.content and text:
+            finished.message = Message.assistant("".join(text), finished.message.tool_calls)
+        return finished
 
     def _emit(self, event: dict[str, Any]) -> None:
         if self.on_event is not None:
