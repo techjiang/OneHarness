@@ -31,6 +31,7 @@ main:
                 python examples/tokens_demo.py
                 python examples/cache_demo.py
                 python examples/shell_demo.py
+                python examples/trim_demo.py
 
   pull_request:
     - stages:
@@ -62,3 +63,4 @@ main:
                 python examples/tokens_demo.py
                 python examples/cache_demo.py
                 python examples/shell_demo.py
+                python examples/trim_demo.py

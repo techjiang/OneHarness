@@ -205,15 +205,26 @@ def count_message(message: Any) -> int:
 
 
 def count_specs(specs: list[dict[str, Any]] | None) -> int:
-    """Tokens for the tool schemas, which ride along on every request.
+    """Tokens the tool schemas cost on the wire, framing included.
 
     This used to count as zero, and that omission cannot be discovered from the
     message list: twenty tools is roughly 1600 tokens a budget never saw, over
     and over, for the whole run.
+
+    It used to count as *almost* zero as well, which was harder to notice: the
+    schemas were measured one `json.dumps` at a time and summed, so the
+    structural punctuation between two tools (`},{` plus the enclosing array)
+    was never counted, and neither was anything a provider adds around them.
+    Four built-in tools came out at 248, while the same schemas are 1011
+    characters of the outgoing request: a 15% estimate of the thing being
+    estimated, invisible because it was wrong in the flattering direction: the
+    budget looked roomier than it was. Counting the whole array as it is
+    serialised, brackets and separators included, brings those four to 251 of
+    264 tokens.
     """
     if not specs:
         return 0
-    return count(json.dumps(specs, ensure_ascii=False))
+    return count(json.dumps({"tools": list(specs)}, ensure_ascii=False))
 
 
 __all__ = ["CALIBRATION", "count", "count_message", "count_specs"]

@@ -520,6 +520,10 @@ big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉�
    再发一次只会拿到同一个 400。于是直接报出 provider 的原话并说明原因——为了塞进窗口
    而丢掉用户的问题，那是在回答另一个问题。
 
+「整轮」的单位是**组**而不是**条**：一段连续的 assistant 消息加上它后面全部的 tool
+消息算一个整体，从组里任何一条开始删都删整组。拆开它换来的不是一个更小的请求，而是一个
+被 `HTTP 400` 拒掉的请求，见下一节。
+
 估算以前是字符数除以 4。v1.2 把它换掉了，原因见下一节——那个规则不是「粗」，
 是**有方向的错**。`--json` 里有 `trim` 字段，只在真的裁过时才出现：
 
@@ -534,6 +538,52 @@ big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉�
 
 `doctor` 也多了一个判定 `context`，和 `protocol` 共用同一个 400：一个说「请求被看懂了，
 只是太大」，一个说「请求本身不合法」。同样是红的，修的地方相反。
+
+## 裁剪不能把请求裁成不合法的
+
+上面那条「**永远不拆开调用和它的结果**」在这个仓库里挂了六个版本，而它只在
+**一轮一个调用**的时候成立。一轮要三个文件的时候，线格式是**一条** assistant 消息
+加**三条** tool 消息；旧的 `_drop_middle` 跳过那条 assistant 消息、继续往后删，
+于是三条结果留了下来，前面没有任何东西声明过它们：
+
+```console
+$ python3 examples/trim_demo.py
+=== 3. the same transcript, trimmed the way v1.6 trimmed it ===
+  outgoing roles: ['system', 'user', 'assistant', 'tool', 'tool', 'tool', 'user']
+  orphaned results: ['c0', 'c1', 'c2']
+
+  endpoint says: HTTP 400
+    Invalid parameter: messages with role 'tool' must be a response to a
+    previous message with 'tool_calls' (missing c0)
+```
+
+这不是「裁得不够干净」，是**把一个诚实的「太大了」，换成了一个不合法的请求**。
+而 `doctor` 会把这条 400 判成 `protocol`，也就是「这是 OneHarness 的 bug」——结论没错，
+但指向的文件不对：这个请求压根不该长成这个样子。
+
+它为什么活了六版：既有的回归测试用的是**一轮一个调用**的形状，那个形状恰好删得干净
+（`examples/trim_demo.py` 第 4 段就是这个对照）。一条测试只守住它写过的那种形状。
+
+现在的规矩按「组」算，不按「条」算：一段连续的 assistant 消息接上它后面的 tool 消息
+是一个整体，从里面任何一条开始删，删的都是整组。第 2 段是同一份 transcript 走新代码、
+对着同一个服务器：
+
+```console
+  outgoing roles: ['system', 'user', 'user']
+  orphaned results: none
+  endpoint says: HTTP 200
+```
+
+工具 schema 那笔账也顺手对了。`count_specs` 以前把每个 schema 单独 `json.dumps`
+再相加，数组的方括号和工具之间的 `},{` 全没算进去：
+
+```console
+  4 built-in tools
+  per-schema sum, separators dropped   245
+  the array as it goes on the wire     251   (876 chars)
+```
+
+差得不多，方向也不算坏，但那个数字喂的是一个硬上限——凭据错得小，也是错。
 
 ## 估算 token：一个方向性的错误
 
@@ -1119,6 +1169,11 @@ prompt 总量、`cached_tokens` 单列，而不是让上层去猜自己拿到的
 `AgentResult.messages` 仍是一份完整的、可以拿去做下一轮 `history` 的记录。
 一份既被截断又被当成记录的历史，比没有记录更糟。
 
+**裁剪的下限是「仍然合法」，不是「仍然小」。** 一轮里三个调用会变成一条 assistant
+消息加三条 tool 消息，所以删的单位是组：从组里任何一条开始，删的都是整组。把一个超大的
+请求换成一个被 400 拒掉的请求，不是改进——那种 400 还会被 `doctor` 判成 `protocol`，
+让人去 `providers/` 里找一个不存在的字段错误。
+
 **shell 工具的错误结果也是有内容的。** 工具失败不抛异常这条规矩，在 shell 上有一个额外
 要求：超时的错误结果里必须带着超时前打印的东西。否则「不炸循环」只是让模型继续往下走，
 而它手上没有任何依据。同理，杀掉进程组不是清理，是让「杀掉了」这句话成立。
@@ -1182,19 +1237,19 @@ oneharness/
   mcp.py          stdio JSON-RPC 的 MCP 客户端：把远端工具变成普通 Tool；服务器崩了立刻
                   报崩（带退出码和 stderr 尾巴）、回服务器发来的请求、关服按进程组杀
   tokens.py       按字符类别估算 token（常数由 tiktoken 离线拟合），零依赖
-  context.py      上下文预算：估算（含工具 schema）、先 elide 工具结果、再丢整轮、
-                  溢出识别、降预算、裁不动时如实报出还差多少
+  context.py      上下文预算：估算（含工具 schema）、先 elide 工具结果、再按「组」丢整轮
+                  （调用和结果永不拆开）、溢出识别、降预算、裁不动时如实报出还差多少
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/tls/proxy/network...
   （缓存断点在 providers/anthropic.py 与 providers/bedrock.py 的 _place_breakpoints）
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            418 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            425 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十六个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
+examples/         十七个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
                   doctor / context / stream_tools / timing / network / network_kinds / tokens /
-                  cache / shell，都不需要 API Key
+                  cache / shell / trim，都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
 
@@ -1218,6 +1273,7 @@ $ python examples/network_kinds_demo.py      # 真证书 / 真代理 / 域名 / 
 $ python examples/tokens_demo.py             # 旧估算错在哪：中文 0.38x、缩进 31.75x
 $ python examples/cache_demo.py              # 同一个循环，放断点后全价 token 少 60%
 $ python examples/shell_demo.py              # shell 工具的五种撒谎方式，新旧实现同进程对照
+$ python examples/trim_demo.py               # 裁剪留下的孤儿 tool 消息：旧代码被 400 拒掉
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

@@ -132,6 +132,77 @@ class FitTests(unittest.TestCase):
         self.assertEqual(fitted[1].content, messages[1].content)
         self.assertGreater(trim.elided, 0)
 
+    def test_multiple_calls_in_one_turn_are_not_orphaned(self):
+        """The shape that produced an HTTP 400: three calls, one assistant turn.
+
+        `test_a_call_is_never_separated_from_its_results` above covers one call
+        per turn, which happened to delete cleanly. With three calls in one
+        turn, the trimmer stepped over the assistant message and left three
+        results answering nothing, and OpenAI rejects that outright:
+
+            HTTP 400: messages with role 'tool' must be a response to a
+            preceding message with 'tool_calls'
+
+        The budget matters: at 124 the three results are already elided, so the
+        first round to go is the one that carries the calls, and every budget
+        from there until the next round fits lands on this shape. A budget that
+        is wrong only inside a narrow window is still a request that never
+        leaves the machine.
+        """
+        messages = [Message.system("be brief"), Message.user("read all three")]
+        messages.append(
+            Message.assistant(
+                "",
+                [
+                    ToolCall.from_raw(call_id=f"c{index}", name="read_file", arguments={})
+                    for index in range(3)
+                ],
+            )
+        )
+        messages.append(Message.assistant("plan: compare them, starting with the parser"))
+        for index in range(3):
+            messages.append(Message.tool(f"c{index}", "z" * 3000, "read_file"))
+        messages.append(Message.user("ok next"))
+
+        fitted, trim = context.fit(messages, 124)
+
+        self.assertGreater(trim.dropped, 0)
+        # The whole group goes: the prose, the turn that declares the calls and
+        # the three results behind it. Anything less leaves a request that the
+        # endpoint rejects.
+        self.assertEqual(fitted[1].role, "user")
+        self.assertEqual([m for m in fitted if m.role == "tool"], [])
+        self.assertEqual([m for m in fitted if m.tool_calls], [])
+
+    def test_a_round_that_cannot_go_whole_does_not_go_in_pieces(self):
+        """Prose with no calls is its own round; the results must not be split off."""
+        messages = [Message.user("go"), Message.assistant("x" * 400)]
+        messages.append(
+            Message.assistant(
+                "",
+                [
+                    ToolCall.from_raw(call_id=f"c{index}", name="read_file", arguments={})
+                    for index in range(2)
+                ],
+            )
+        )
+        for index in range(2):
+            messages.append(Message.tool(f"c{index}", "y" * 4000, "read_file"))
+
+        fitted, trim = context.fit(messages, 40)
+
+        self.assertGreater(trim.dropped, 0)
+        self.assertEqual([m.role for m in fitted if m.role == "tool"], [])
+        calls = {call.id for message in fitted for call in message.tool_calls}
+        self.assertEqual(calls, set())
+
+    def test_the_newest_user_turn_is_never_the_thing_that_gets_dropped(self):
+        messages = [Message.user("old question"), Message.tool("c0", "z" * 8000, "read_file")]
+        messages.append(Message.user("the real task"))
+        fitted, trim = context.fit(messages, 30)
+        self.assertEqual(fitted[-1].content, "the real task")
+        self.assertGreater(trim.dropped, 0)
+
     def test_the_transcript_itself_is_never_mutated(self):
         messages = [Message.user("go"), Message.tool("c1", "x" * 8000, "read_file")]
         original = list(messages)
@@ -233,9 +304,15 @@ class UnmetTests(unittest.TestCase):
                 )
             )
             messages.append(Message.tool(f"c{index}", "ok", "read_file"))
-        _, trim = context.fit(messages, 60)
+        outgoing, trim = context.fit(messages, 60)
         self.assertEqual(trim.elided, 0)
-        self.assertGreater(trim.after, trim.before - 1)
+        # The stub swap is what is being tested, so the check is on the results
+        # that survived: a small result that got "elided" into a longer notice
+        # would be the bug, whether or not whole rounds were dropped as well.
+        for message in outgoing:
+            if message.role == "tool":
+                self.assertEqual(message.content, "ok")
+        self.assertGreater(trim.after, 0)
 
     def test_what_the_trimmer_cannot_reach_is_reported(self):
         messages = [Message.system("be brief"), Message.user("x" * 4000)]

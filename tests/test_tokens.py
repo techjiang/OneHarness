@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 
 from oneharness import context, tokens
+from oneharness.builtin import make_file_tools
+from oneharness.tools import tool
 from oneharness.types import Message, ToolCall
 
 FIXTURE = Path(__file__).parent / "fixtures" / "token_counts.json"
@@ -202,6 +204,56 @@ class HoldoutTests(unittest.TestCase):
             new.append(abs(math.log(tokens.count(text) / real)))
         self.assertLess(max(new), max(old))
         self.assertLess(max(new), math.log(1.5))
+
+
+class SchemaWireTests(unittest.TestCase):
+    """The schemas are counted as serialised, not tool by tool.
+
+    Counting each schema with its own `json.dumps` and summing the results drops
+    every separator between them and the array brackets around them, so the
+    answer is short by however much framing there is. That direction of error is
+    the one nobody investigates: the budget looks roomier than it is.
+    """
+
+    def setUp(self):
+        @tool
+        def alpha(path: str) -> str:
+            """A tool."""
+
+        @tool
+        def beta(count: int, label: str = "x") -> str:
+            """Another tool, with two parameters."""
+
+        @tool
+        def gamma(name: str) -> str:
+            """A third."""
+            return name
+
+        files = [item.spec() for item in make_file_tools()]
+        self.specs = [alpha.spec(), beta.spec(), gamma.spec(), *files]
+
+    def test_the_brackets_and_commas_are_counted(self):
+        separate = sum(tokens.count(json.dumps(spec)) for spec in self.specs)
+        self.assertGreater(tokens.count_specs(self.specs), separate)
+
+    def test_the_count_follows_the_serialised_size(self):
+        wire = len(json.dumps({"tools": self.specs}, ensure_ascii=False))
+        counted = tokens.count_specs(self.specs)
+        # Within a factor that says "this is the same array", not "this is the
+        # sum of its parts": 876 characters of schema come out at 251 tokens.
+        self.assertGreater(counted, wire / 5)
+        self.assertLess(counted, wire)
+
+    def test_more_tools_never_cost_less(self):
+        one = tokens.count_specs(self.specs[:1])
+        two = tokens.count_specs(self.specs[:2])
+        three = tokens.count_specs(self.specs)
+        self.assertLess(one, two)
+        self.assertLess(two, three)
+
+    def test_no_tools_cost_nothing(self):
+        self.assertEqual(tokens.count_specs([]), 0)
+        self.assertEqual(tokens.count_specs(None), 0)
 
 
 class LegacyTests(unittest.TestCase):

@@ -176,30 +176,88 @@ def _elide_results(messages: list[Message], budget: int, specs: list[dict[str, A
 
 
 def _drop_middle(messages: list[Message], budget: int, specs: list[dict[str, Any]] | None) -> int:
-    """Delete whole exchanges from the start, never splitting a call from its results.
+    """Delete whole rounds from the start, never splitting a call from its results.
 
-    Splitting them would leave an orphan tool message, which OpenAI rejects
-    outright -- trading an oversized request for an invalid one is not an
-    improvement. Three messages are never dropped: the system prompt (who to
-    be), the first user turn (what the task is) and the newest user turn. The
-    middle one is also what keeps the request *valid* after trimming: both
-    Anthropic and Bedrock require the first non-system turn to be a user turn.
+    A round is a run of messages that only makes sense together: any prose and
+    the assistant turn that declares the calls, plus every `tool` message
+    answering them. Rounds go or stay as a unit. Two things depend on that, and
+    only one of them is about size:
+
+    * Deeper in the tool loop the older rounds are the least likely to still
+      matter, so they are the cheapest thing to lose after elided results.
+    * A request whose history starts with a `tool` message is not a smaller
+      request, it is an invalid one. OpenAI says so directly:
+
+            HTTP 400: messages with role 'tool' must be a response to a
+            preceding message with 'tool_calls'
+
+      Every provider that carries tool results has an equivalent rule, because
+      a result with no call is not something a model can act on.
+
+    Three messages are never dropped: the system prompt (who to be), the first
+    user turn (what the task is) and the newest user turn. The newest one is
+    also what keeps the request *valid*: Anthropic and Bedrock require the first
+    non-system message to be a user turn, so trimming may not promote whatever
+    came before the last question into that slot.
+
+    The rounds are measured by walking the list that is actually going out, not
+    by counting ahead: an earlier version stepped `head` over an assistant turn
+    and left its three results behind. The endpoint's answer to that is the 400
+    above, and `doctor` files a 400 about `tool_calls` as a OneHarness bug --
+    the right verdict for the wrong reason, since the request never should have
+    been shaped that way in the first place.
     """
     head = 1 if messages and messages[0].role == "system" else 0
     if head < len(messages) and messages[head].role == "user":
         head += 1
-    tail = _last_user_index(messages, head)
     dropped = 0
-    index = head
-    while index < tail and estimate(messages, specs) > budget:
-        end = index + 1
-        if messages[index].role == "assistant":
-            while end < tail and messages[end].role == "tool":
-                end += 1
-        dropped += end - index
-        del messages[index:end]
-        tail -= end - index
+    while head < len(messages) and estimate(messages, specs) > budget:
+        start, end = _round_end(messages, head)
+        if end <= start:  # only the anchors are left
+            break
+        dropped += end - start
+        del messages[start:end]
+        head = start
     return dropped
+
+
+def _round_end(messages: list[Message], head: int) -> tuple[int, int]:
+    """The slice of `messages` that one round occupies, given where to start.
+
+    The caller proposes `head` -- the message after the anchors -- and gets back
+    what would actually go. The two can differ, for two reasons:
+
+    **A result does not outlive its call.** Every provider that carries tool
+    results requires one to follow the turn that asked for it; OpenAI says it
+    plainly:
+
+        HTTP 400: messages with role 'tool' must be a response to a preceding
+        message with 'tool_calls'
+
+    So a turn that declares calls and the `tool` messages behind it leave
+    together. A previous version stepped over the assistant turn and deleted
+    only what followed it, which is why the bug needed two calls in a turn
+    before it showed: with a single call the two halves happened to be removed
+    in order, and the request stayed valid by accident.
+
+    **The group, not the message.** A stretch of assistant messages followed by
+    `tool` messages is one thing: text that announces a call, the call, and the
+    results. Starting anywhere inside it takes the whole thing.
+
+    The newest user turn is the boundary, not part of any round: dropping it
+    would answer question N as if it were question N+1.
+    """
+    newest_user = _last_user_index(messages, head)
+    limit = newest_user if newest_user > head else len(messages)
+    start = head
+    while start > 0 and messages[start - 1].role in ("assistant", "tool"):
+        start -= 1
+    if head < limit and messages[head].role in ("assistant", "tool"):
+        end = head + 1
+        while end < limit and messages[end].role in ("assistant", "tool"):
+            end += 1
+        return start, end
+    return start, start + 1
 
 
 def _last_user_index(messages: list[Message], head: int) -> int:
