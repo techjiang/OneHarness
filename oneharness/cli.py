@@ -229,7 +229,9 @@ def _connect_mcp(
             client.close()
             for started in clients:
                 started.close()
-            raise McpError(f"MCP server {server.command[0]!r}: {exc}") from exc
+            # The error already names its server; wrapping it in the command
+            # again produced "MCP server 'python3': MCP server 'python3' ...".
+            raise McpError(str(exc)) from exc
 
         taken = {item.name for item in tools}
         clashes = sorted({item.name for item in exposed} & taken)

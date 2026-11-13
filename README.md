@@ -27,7 +27,9 @@
    缓存断点——工具循环每一步都重发整个历史，那两个 provider 不放就是每一步全价；
 12. 不替 shell 撒谎：超时了也把已经打印出来的东西带回来，说杀了就真的杀掉整棵
    进程树，`stderr` 和 `stdout` 按真实顺序混在一条管道里，二进制输出不当异常，
-   刷屏的输出边读边裁（保留头尾）。
+   刷屏的输出边读边裁（保留头尾）；
+13. 不把「服务器死了」报成「超时了」：MCP server 崩了立刻说崩了、带上它自己那句
+   遗言，还顺手回它发过来的请求；`close()` 等的是关掉，不是等它自己走。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -233,6 +235,51 @@ prefix = "fs."     # 可选；两个 server 有同名工具时用它区分
   让模型看到原因自己换路数；只有连接断了、握手超时这种才抛。
 - **工具名撞车在启动时就报错**，不会留到运行中途才 ambiguous。服务器在 run 结束时一定被关掉，
   异常路径也一样。
+
+### 「没答」和「死了」不是一件事
+
+v1.4 的客户端对每一种失败都只有一句话：*did not answer in 30s*。而一个 `KeyError:
+'database_url'` 退出的服务器从不说一个字——于是客户端等满了超时，然后把锅甩给时钟，
+把那段 traceback（唯一说清该修什么的东西）收进一个列表然后没人读过。
+
+```console
+v1.4  30.00s  MCP server did not answer initialize in 30.0s
+now    0.05s  MCP server 'python3' exited with code 3 before answering initialize;
+              last stderr: Traceback (most recent call last): | ... |
+              ValueError: MISSING_TOKEN is not set
+```
+
+三种表现，`examples/mcp_health_demo.py` 里逐条对照：
+
+**1. 崩在手握手里。** 进程 0.05 秒前就退出了，理由写在 stderr 上，而客户端还在等。
+
+**2. 崩在一次工具调用里。** 同一个形状，只是 run 已经跑起来了。旧版把这次崩溃报成
+`did not answer tools/call in 10s`——一个关于崩溃的超时故事，模型据此会去重试一个永远
+不会回来的服务器。现在它是 `ToolResult(is_error=True)`，带着退出码和最后几行 stderr，
+循环不炸，模型自己能决定换条路。
+
+**3. 服务器发来一个 `ping`。** 协议是双向的：服务器可以发请求并等你回。旧版把没有
+自己 id 的消息全部丢掉，于是两个进程互相等着——而客户端把这个僵局叫做「超时」。
+现在 `ping` 回 `{}`，别的方法回 `-32601`（明说不支持，比沉默好）。
+
+判断「死了」不靠时钟靠管道：stdout 读到 EOF 就是「从这一刻起它不会再有答案」，接着
+`poll()` 拿退出码、把 stderr 最后三行带上。所以上面那些数字是 0.05s，不是 30s。
+
+### `close()` 等的是关掉，不是等对方自己走
+
+服务器如果包了另一个进程，那个孙子会继承 stdout。杀掉服务器之后孙子还在、管道还开着、
+读线程还阻塞在 `read()` 里——而旧版 `close()` 是**从另一个线程关掉那个被读的流**，
+`close()` 会等这把锁，于是关服时间等于孙子的寿命：
+
+```console
+子进程活 10 秒
+  v1.4  10.00s  close() 把它整个寿命等完了
+  now    0.00s  立刻返回，孙子也没了
+```
+
+现在服务器起在自己的会话里（`start_new_session=True`），关服按进程组 `SIGTERM` →
+`SIGKILL`；读线程自己拥有并关闭自己的流，别的线程不碰。这也是 `run_shell` 在 v1.4
+学的同一课：**「说杀了」的意思必须是杀掉了**，而不是「我发了个信号」。
 
 ## 子 agent
 
@@ -1132,7 +1179,8 @@ oneharness/
                   每步拆出 model / tool 两段耗时与首 token 时间
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具；shell 边读边裁、按进程组杀、保留超时前的输出
-  mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
+  mcp.py          stdio JSON-RPC 的 MCP 客户端：把远端工具变成普通 Tool；服务器崩了立刻
+                  报崩（带退出码和 stderr 尾巴）、回服务器发来的请求、关服按进程组杀
   tokens.py       按字符类别估算 token（常数由 tiktoken 离线拟合），零依赖
   context.py      上下文预算：估算（含工具 schema）、先 elide 工具结果、再丢整轮、
                   溢出识别、降预算、裁不动时如实报出还差多少
@@ -1142,11 +1190,11 @@ oneharness/
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            412 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            418 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十五个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing / network / network_kinds / tokens / cache /
-                  shell，都不需要 API Key
+examples/         十六个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
+                  doctor / context / stream_tools / timing / network / network_kinds / tokens /
+                  cache / shell，都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
 
@@ -1157,6 +1205,7 @@ $ python -m unittest discover -s tests -v    # 全部测试
 $ python examples/e2e_demo.py                # 端到端，起本地假 provider
 $ python examples/stream_demo.py             # 流式 + 跨 chunk 的工具调用
 $ python examples/mcp_demo.py                # CLI 真拉一个 MCP 子进程
+$ python examples/mcp_health_demo.py         # 服务器崩了 / 死了 / 发 ping / 包了孙子，新旧客户端对照
 $ python examples/delegate_demo.py           # 串行 vs 并发、子 agent 委派
 $ python examples/fanout_demo.py             # 一次派三个子 agent，逐个 vs 同时
 $ python examples/bedrock_demo.py            # 签名回验 + 二进制帧流，本地假 Bedrock

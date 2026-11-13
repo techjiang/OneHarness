@@ -11,7 +11,7 @@ from oneharness.errors import (
     ProviderError,
     ToolError,
 )
-from oneharness.mcp import McpClient, connect_mcp
+from oneharness.mcp import McpClient, McpError, McpServerGone, connect_mcp
 from oneharness.providers import create_provider, list_presets
 from oneharness.tape import Tape, TapeError
 from oneharness.tools import Registry, Tool, tool
@@ -26,7 +26,7 @@ from oneharness.types import (
     Usage,
 )
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 __all__ = [
     "Agent",
@@ -37,6 +37,8 @@ __all__ = [
     "DelegationError",
     "Delegator",
     "McpClient",
+    "McpError",
+    "McpServerGone",
     "Message",
     "NetworkError",
     "OneHarnessError",
