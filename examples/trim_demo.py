@@ -163,7 +163,7 @@ def part_four() -> None:
     one.append(Message.assistant("", [call]))
     one.append(Message.tool("c0", "x" * 4000, "read_file"))
     one.append(Message.user("thanks, now fix it"))
-    for label, build in (("v1.6", old_trim), ("v1.7", lambda m, b: context_module.fit(m, b)[0])):
+    for label, build in (("v1.6", old_trim), ("now", lambda m, b: context_module.fit(m, b)[0])):
         out = build(list(one), 120)
         print(f"  {label}: orphaned results {orphans(out) or 'none'}")
     print()
