@@ -39,6 +39,9 @@ DEFAULT_REGION = "us-east-1"
 
 class BedrockProvider(Provider):
     name = "bedrock"
+    # Nothing is cached unless a breakpoint says where, so this is the one place
+    # `--cache` changes what goes on the wire rather than only what is reported.
+    cache_mode = "explicit"
 
     def __init__(
         self,
@@ -50,12 +53,16 @@ class BedrockProvider(Provider):
         temperature: float = 0.0,
         max_tokens: int | None = None,
         timeout: float = 120.0,
+        cache: bool = False,
     ) -> None:
         super().__init__(model, temperature=temperature, max_tokens=max_tokens)
         self.credentials = credentials
         self.region = region
         self.base_url = (base_url or f"https://bedrock-runtime.{region}.amazonaws.com").rstrip("/")
         self.timeout = timeout
+        # Same models as Anthropic, same rule: a breakpoint (`cachePoint`) has to
+        # be placed or the prefix is billed again on every step.
+        self.cache = cache
 
     # -- requests --------------------------------------------------------
 
@@ -212,6 +219,8 @@ class BedrockProvider(Provider):
                     for spec in tools
                 ]
             }
+        if self.cache:
+            _place_breakpoints(payload)
         return payload
 
     def _split(self, messages: Sequence[Message]) -> tuple[str, list[dict[str, Any]]]:
@@ -298,9 +307,46 @@ class BedrockProvider(Provider):
 
     @staticmethod
     def _usage(raw: Any) -> Usage | None:
+        """Converse usage, with the cache fields the Converse API added later.
+
+        Like Anthropic (same models, same cache), `inputTokens` excludes what
+        was read from the cache; `cacheReadInputTokens` and
+        `cacheWriteInputTokens` sit beside it. Old Converse responses simply do
+        not carry them, which is why every field is read with `or 0` rather than
+        indexed.
+        """
         if not isinstance(raw, dict):
             return None
+        read = int(raw.get("cacheReadInputTokens") or 0)
+        write = int(raw.get("cacheWriteInputTokens") or 0)
         return Usage(
-            input_tokens=int(raw.get("inputTokens") or 0),
+            input_tokens=int(raw.get("inputTokens") or 0) + read + write,
             output_tokens=int(raw.get("outputTokens") or 0),
+            cached_tokens=read,
+            cache_write_tokens=write,
         )
+
+
+# Converse spells breakpoints differently from the Messages API -- a
+# `{"cachePoint": {"type": "default"}}` block inside the same list the content
+# lives in -- but the placement logic is identical, and so is the reason for it.
+def _place_breakpoints(payload: dict[str, Any]) -> None:
+    """Mark the repeating prefix: tools, then system, then the newest turn.
+
+    Converse walks the request in that order, so a breakpoint that is not on the
+    last tool cannot cover the tools at all. Two blocks are also *not* enough:
+    the system list keeps its own breakpoint, and the messages list gets one at
+    the very end so the next step's history is a read.
+    """
+    point = {"cachePoint": {"type": "default"}}
+    tool_config = payload.get("toolConfig")
+    if isinstance(tool_config, dict) and tool_config.get("tools"):
+        tool_config["tools"].append(point)
+
+    system = payload.get("system")
+    if isinstance(system, list) and system:
+        system.append(point)
+
+    turns = payload.get("messages") or []
+    if turns and turns[-1].get("content"):
+        turns[-1]["content"].append(point)

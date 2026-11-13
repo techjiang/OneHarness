@@ -9,3 +9,4 @@ dist/
 .mypy_cache/
 .coverage
 examples/.demo-workspace/
+.shots/

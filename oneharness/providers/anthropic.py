@@ -20,6 +20,9 @@ from oneharness.types import (
 
 class AnthropicProvider(Provider):
     name = "anthropic"
+    # Nothing is cached unless a breakpoint says where, so this is the one place
+    # `--cache` changes what goes on the wire rather than only what is reported.
+    cache_mode = "explicit"
 
     def __init__(
         self,
@@ -33,6 +36,7 @@ class AnthropicProvider(Provider):
         anthropic_version: str = "2023-06-01",
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache: bool = False,
     ) -> None:
         super().__init__(model, temperature=temperature, max_tokens=max_tokens)
         self.api_key = api_key
@@ -41,6 +45,12 @@ class AnthropicProvider(Provider):
         self.anthropic_version = anthropic_version
         self.extra_headers = dict(extra_headers or {})
         self.extra_body = dict(extra_body or {})
+        # Anthropic is the one provider that caches *only* where you ask it to:
+        # a request with no `cache_control` breakpoint is billed in full, every
+        # time. That makes a tool loop -- which resends the whole history on
+        # every step by construction -- the worst possible shape for it unless
+        # the breakpoints are placed.
+        self.cache = cache
 
     def complete(
         self,
@@ -73,8 +83,7 @@ class AnthropicProvider(Provider):
             if kind == "message_start":
                 info = chunk.get("message") or {}
                 model = info.get("model") or model
-                raw_usage = info.get("usage") or {}
-                usage = Usage(input_tokens=int(raw_usage.get("input_tokens") or 0))
+                usage = _usage(info.get("usage") or {})
             elif kind == "content_block_start":
                 index = int(chunk.get("index", 0))
                 block = chunk.get("content_block") or {}
@@ -181,6 +190,8 @@ class AnthropicProvider(Provider):
                 }
                 for spec in tools
             ]
+        if self.cache:
+            _place_breakpoints(payload)
         payload.update(self.extra_body)
         return payload
 
@@ -249,15 +260,80 @@ class AnthropicProvider(Provider):
                     )
                 )
 
-        usage_data = data.get("usage") or {}
-        usage = Usage(
-            input_tokens=int(usage_data.get("input_tokens") or 0),
-            output_tokens=int(usage_data.get("output_tokens") or 0),
-        )
         return Completion(
             message=Message.assistant("".join(text_parts), calls),
-            usage=usage,
+            usage=_usage(data.get("usage") or {}),
             model=data.get("model") or self.model,
             stop_reason=data.get("stop_reason"),
             raw=data,
         )
+
+
+def _usage(raw: dict[str, Any]) -> Usage:
+    """Anthropic usage, where `input_tokens` means "the part you paid for".
+
+    This is the one provider whose prompt count is *exclusive*: a request that
+    read 2000 tokens out of the cache reports `input_tokens: 12` and
+    `cache_read_input_tokens: 2000`. Reported as-is, a run that is 99% cached
+    looks like a run that got cheaper -- and it did, but it also looks like a
+    prompt of 12 tokens, which no budget arithmetic should ever believe.
+    So the total is summed here, once, and the cached half kept beside it.
+    """
+    read = int(raw.get("cache_read_input_tokens") or 0)
+    write = int(raw.get("cache_creation_input_tokens") or 0)
+    return Usage(
+        input_tokens=int(raw.get("input_tokens") or 0) + read + write,
+        output_tokens=int(raw.get("output_tokens") or 0),
+        cached_tokens=read,
+        cache_write_tokens=write,
+    )
+
+
+# Anthropic accepts at most four `cache_control` breakpoints per request, and
+# they are read as a prefix: everything before the last one is a candidate for
+# the cache. Three are placed, which is the number that matches how this loop
+# actually is shaped.
+MAX_BREAKPOINTS = 4
+
+
+def _place_breakpoints(payload: dict[str, Any]) -> None:
+    """Mark the parts of the request that repeat, so they are paid for once.
+
+    Order matters on the wire: the cacheable prefix runs tools -> system ->
+    messages, so a breakpoint in the messages can only ever be a hit if the
+    tools and the system prompt are also inside the cached region. Marking only
+    the last message on a request whose tool schemas changed every step would
+    therefore cache nothing at all.
+
+    Three breakpoints:
+
+    * **the last tool** -- twenty tool schemas are a fixed 1600 tokens sitting
+      in front of every request of the run;
+    * **the system prompt** -- fixed for the whole run, by definition;
+    * **the end of the last message** -- the sliding part. Step N+1 sends
+      everything step N sent plus one turn, so this breakpoint turns the
+      previous step's whole history into a cache read, and only the new turn is
+      billed at full price.
+    """
+    tools = payload.get("tools") or []
+    if tools:
+        tools[-1]["cache_control"] = {"type": "ephemeral"}
+
+    system = payload.get("system")
+    if isinstance(system, str) and system:
+        payload["system"] = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+
+    turns = payload.get("messages") or []
+    if turns:
+        content = turns[-1].get("content")
+        if isinstance(content, str):
+            if content:
+                turns[-1]["content"] = [
+                    {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+                ]
+        elif isinstance(content, list) and content:
+            # A tool result turn or a block list: mark the last block, which is
+            # the end of the prefix a later request will re-send.
+            content[-1]["cache_control"] = {"type": "ephemeral"}

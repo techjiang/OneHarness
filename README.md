@@ -21,7 +21,10 @@
    自己的错误类型和一句能读的话，退避也照对方说的等；而且**说清是哪种没答**：证书被拒、
    代理要密码、域名解析不了、端口没人听，四种「没答」四种修法；
 10. 数得清一个请求有多大：按字符类别估算 token 而不是 `chars / 4`（中文差 2.6 倍、
-   缩进差 32 倍），把工具 schema 也算进去，裁不动的时候如实说还差多少。
+   缩进差 32 倍），把工具 schema 也算进去，裁不动的时候如实说还差多少；
+11. 知道哪些 token 是打折的：五种线格式的缓存字段各不相同（有的含在 prompt 里、
+   有的不含），统一成一个 `Usage` 再报出来，Anthropic / Bedrock 还能顺手放好
+   缓存断点——工具循环每一步都重发整个历史，那两个 provider 不放就是每一步全价。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -87,6 +90,7 @@ $ oneharness run "看看这个仓库" --stream
 $ oneharness run "整理这次改动" --delegate --parallel 4
 $ oneharness run "查一下今天的文件" --mcp "npx -y @modelcontextprotocol/server-filesystem ."
 $ oneharness run "读一遍整个仓库" --context-budget 32000   # 单个请求的 token 上限
+$ oneharness run "整理这次改动" --cache --provider anthropic  # 放缓存断点，历史只付一次
 $ oneharness run "ping" --record run.json     # 把这次的所有请求存成 tape
 $ oneharness run "ping" --replay run.json     # 不联网、不需要 key，重放同一次
 $ oneharness run "整理这次改动" --timing       # 每步拆成「等模型」和「等工具」
@@ -807,6 +811,112 @@ agent 循环里那条「有半句话，留住它」的分支 `except ProviderErr
 底下溜过去，把半句话再丢一次。所以 `NetworkError` **继承** `ProviderError`，`status`
 保持 `None`（没人会把它读成 provider 主动拒绝），只是多了一个 `kind` 和一个 `hint`。
 
+## 缓存：一个工具循环会把历史买三遍
+
+这个 harness 的循环结构决定了每一步都要把整段历史重发一次。第 5 步的请求里躺着第 1 到
+第 4 步的全部内容，而它们的字面一个字节都没变。**这不是 bug，这是 agent 循环的定义** ——
+但如果 provider 提供了 prompt cache，而你什么都不做，这段不动的前缀就会每一步全价买一次：
+
+```console
+$ python3 examples/cache_demo.py
+=== 1. the same steps, no breakpoints: every turn is paid for again ===
+  no breakpoints
+    steps                 5
+    prompt sent, summed   42138  (per step: 49, 4238, 8428, 12617, 16806)
+    read from the cache   0
+    paid at full price    42138
+
+=== 2. the same steps, breakpoints placed by `--cache` ===
+  with breakpoints
+    steps                 5
+    prompt sent, summed   42181  (per step: 52, 4238, 8428, 12617, 16806)
+    read from the cache   25283  (per step: 0, 0, 4238, 8428, 12617)
+    paid at full price    16858
+    written to the cache  16806
+
+  prompt tokens paid at full price: 42138 -> 16858
+  saved: 25280 tokens (60%)
+```
+
+两次运行的请求字节几乎相同，唯一的区别是多了三个 `cache_control` 标记。**所有命中都是
+那个假服务器拿它自己收到的字节算出来的**，harness 没有告诉它任何事。
+
+### 五种线格式，一个 `Usage`
+
+报出「缓存了多少」之前得先定义「缓存了多少」。这五家连这个都不一样：
+
+| provider | 字段 | 语义 |
+|---|---|---|
+| OpenAI / DeepSeek | `prompt_tokens_details.cached_tokens`、`prompt_cache_hit_tokens` | prompt 总量的**一部分** |
+| Gemini | `cachedContentTokenCount` | `promptTokenCount` 的**一部分** |
+| Anthropic | `cache_read_input_tokens` + `cache_creation_input_tokens` | **不在** `input_tokens` 里 |
+| Bedrock | `cacheReadInputTokens` / `cacheWriteInputTokens` | **不在** `inputTokens` 里 |
+
+四家是「含在里面」，两家是「在外面」。天真地把它们加起来，四家会重复计费；天真地不加，
+Anthropic 上一个 2000 tokens 里 1988 走了缓存的请求会被读成「这个 prompt 只有 12 个
+token」。而 `Usage.input_tokens` 同时是算成本的输入和上下文预算的参照 —— 一个既用来报账
+又用来做决策的数字，错在哪个方向都是坏的。
+
+所以适配层各自归一，上层只见：
+
+```json
+"usage": {
+  "input_tokens": 2052, "output_tokens": 5, "total_tokens": 2057,
+  "cache": {"read_tokens": 2000, "write_tokens": 40, "hit_rate": 0.974}
+}
+```
+
+`input_tokens` 永远是 prompt 总量，`cached_tokens` 永远是其中的便宜部分。没缓存的时候
+`cache` 这个键**不存在** —— 一个恒为 0 的块会被读成「缓存坏了」，而缺字段读成「没缓存」，
+这是真的。
+
+### 断点放哪儿，以及为什么是这三个
+
+`--cache`（或 `[provider] cache = true`、`ONEHARNESS_CACHE=1`）只对 `cache_mode =
+"explicit"` 的两家有效：Anthropic 和 Bedrock **只有你明确要求的地方才缓存**，而 OpenAI /
+Gemini / DeepSeek 自己会缓存重复前缀。所以这个开关不是「打开缓存」，是「在被要求时才
+放断点的两家上放断点」；对另外三家它什么也不做——因为线上根本没有那个字段可放。
+
+Anthropic 的缓存是**前缀**缓存，断点最多四个，读的时候是「最后一个断点之前的全部」。于是
+顺序很重要：线上顺序是 tools → system → messages，落在 messages 里的断点只有在前两者
+也在缓存区内时才可能命中。三个断点：
+
+- **最后一个工具**：20 个工具 schema 约 1600 tokens，是整轮 run 里最不动的部分；
+- **system prompt**：整轮 run 里按定义不动；
+- **最后一条消息的末尾**：滑动的那一段。第 N+1 步发的就是第 N 步发的所有东西加一轮，
+  所以这个断点把上一步的整个历史变成一次读，只有新的一轮是全价。
+
+写这个 demo 时第一版的假服务器按「断点是否命中」判断，结果第二步之后全是 miss。原因是它
+把 `cache_control` 标记也算进了缓存键——每一步断点都往后移，于是前面那些块的字节变了。
+真实的实现比的是内容，不是标记。**这个 bug 修在服务器上，不是修在断点上**：它看起来完全像
+断点放错了位置。
+
+### 这轮没做到的，说清楚
+
+**这个 demo 里的服务器仍然是我按规范写的，所以它证明不了规范读对了。** 它证明的是一件更
+窄的事：给定那条规则，这台 harness 放的这三个断点是会产生命中的那三个。真机上命中多少，
+要看 `[cache] ...` 那行。
+
+**Bedrock 的 `cachePoint` 一次都没对真 AWS 跑过。** 它的位置逻辑和 Anthropic 一样，测试也
+覆盖了，但「Converse 接受这个块形状」这件事只有文档支撑。
+
+**成功响应的真 tape 还是空的** —— 这是第七次说同一件事了。`fixtures/tapes/` 里全是拒绝
+响应，所以「解码一整条真实回答」这条路仍然只有假服务器在验，缓存字段也一样。谁有任意一家
+的 key，`oneharness doctor <preset> --record t.json` 提上来就行。
+
+### 顺手做的：估算对账
+
+`--timing` 下多一行，把 `tokens.py` 的估算和 provider 自己数的 prompt token 摆在一起：
+
+```console
+$ oneharness run "read notes.md" --provider anthropic --timing --cache
+[cache] 25459 of 42434 prompt tokens read (60%), 16865 written
+[estimate] 40145 token(s) estimated vs 42434 counted by the provider over 5 step(s): 5% off
+```
+
+这两个数是**两个独立来源**，这才是它值得打印的原因 —— 一个估算如果只和自己比，永远是对的。
+v1.2 声称平均误差 5%，这里就是它在真实计数器上的样子。
+
 ## 配置
 
 就近找 `oneharness.toml`（从当前目录逐级向上，最后看 `~/.config/`）：
@@ -817,6 +927,7 @@ preset = "deepseek"          # 完整列表见 `oneharness presets`
 model = "deepseek-chat"
 temperature = 0
 max_tokens = 4096
+cache = false                # 仅对 anthropic / bedrock 有效：放 prompt 缓存断点
 
 [agent]
 system = "你是简洁的工程师，先看代码再改。"
@@ -832,7 +943,8 @@ max_parallel = 4             # 同时跑几个子 agent；省略则跟随 [agent
 
 环境变量优先于文件：`ONEHARNESS_PROVIDER`、`ONEHARNESS_MODEL`、`ONEHARNESS_API_KEY`、
 `ONEHARNESS_BASE_URL`、`ONEHARNESS_SYSTEM`、`ONEHARNESS_MAX_STEPS`、`ONEHARNESS_MAX_PARALLEL`、
-`ONEHARNESS_CONTEXT_BUDGET`。
+`ONEHARNESS_CONTEXT_BUDGET`、`ONEHARNESS_CACHE`（`1`/`true`/`yes`/`on`，`0`/`false`/`no`/`off`
+—— 一个别的词是错误，不是真值）。
 
 API Key 走各 provider 的常规变量名：`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、
 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`）、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY`、
@@ -885,6 +997,11 @@ model = "Qwen2.5-72B-Instruct"
 「粗」是一个不成立的借口：算少了白挨一次 400，算多了白删一段塞得下的上下文。
 常数来自 `tiktoken` 的离线拟合，但 `tiktoken` 不进依赖——标定工具和运行时的库是两件事。
 
+**缓存字段是归一过的，不是直接转述的。** 五家的「缓存了多少」定义不一致：四家含在
+prompt 总量里，Anthropic 和 Bedrock 不含。所以 `Usage.input_tokens` 在适配层就统一成
+prompt 总量、`cached_tokens` 单列，而不是让上层去猜自己拿到的是哪一种口径——那个数字
+同时被用来算成本和做预算决策，错在哪个方向都会毁掉一端。
+
 **裁的是请求，不是记录。** 上下文预算只在「发到线上」的那份列表上生效，
 `AgentResult.messages` 仍是一份完整的、可以拿去做下一轮 `history` 的记录。
 一份既被截断又被当成记录的历史，比没有记录更糟。
@@ -934,7 +1051,7 @@ Ctrl-C 退出码 130。把半句话当成完整答案是一种撒谎，把已经
 
 ```
 oneharness/
-  types.py        Message / ToolCall / Completion / Usage / ToolResult / StreamEvent
+  types.py        Message / ToolCall / Completion / Usage（含跨五家的 cache 归一）/ ToolResult
   sigv4.py        AWS Signature V4：一个纯函数，两处签名（请求 + 每次重试）
   eventstream.py  vnd.amazon.eventstream 二进制帧编解码，两个 CRC 都校验
   transport.py    urllib 封装：JSON POST + SSE + 裸字节流；丢连接收成 ProviderError，
@@ -951,13 +1068,14 @@ oneharness/
                   溢出识别、降预算、裁不动时如实报出还差多少
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/tls/proxy/network...
+  （缓存断点在 providers/anthropic.py 与 providers/bedrock.py 的 _place_breakpoints）
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            373 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            403 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十三个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing / network / network_kinds / tokens，
+examples/         十四个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing / network / network_kinds / tokens / cache，
                   都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
@@ -979,6 +1097,7 @@ $ python examples/timing_demo.py             # 同样的墙钟、不同的元凶
 $ python examples/network_demo.py            # 真 socket：重置、半帧、Retry-After
 $ python examples/network_kinds_demo.py      # 真证书 / 真代理 / 域名 / 端口：四种「没答」
 $ python examples/tokens_demo.py             # 旧估算错在哪：中文 0.38x、缩进 31.75x
+$ python examples/cache_demo.py              # 同一个循环，放断点后全价 token 少 60%
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

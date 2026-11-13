@@ -101,6 +101,45 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("without a final answer", err)
 
+    def test_cache_line_names_the_prompt_and_the_hit_rate(self):
+        script = [
+            Completion(message=Message.assistant("done"), usage=Usage(1000, 20, cached_tokens=768))
+        ]
+        with self.patch_agent(script):
+            code, _, err = run_cli(["run", "go", "--workspace", str(self.root)])
+        self.assertEqual(code, 0)
+        self.assertIn("[cache] 768 of 1000 prompt tokens read (77%)", err)
+
+    def test_no_cache_line_when_nothing_was_cached(self):
+        """A `cache: 0` line on every run of every provider stops being read."""
+        script = [Completion(message=Message.assistant("done"), usage=Usage(20, 4))]
+        with self.patch_agent(script):
+            _, _, err = run_cli(["run", "go", "--workspace", str(self.root)])
+        self.assertNotIn("[cache]", err)
+
+    def test_estimate_is_compared_only_under_timing(self):
+        script = [
+            Completion(message=Message.assistant("done"), usage=Usage(1000, 4, cached_tokens=900))
+        ]
+        with self.patch_agent(script):
+            _, _, err = run_cli(["run", "go", "--workspace", str(self.root), "--timing"])
+        self.assertIn("[estimate]", err)
+        self.assertIn("counted by the provider", err)
+
+    def test_cache_flag_reaches_the_provider(self):
+        seen = {}
+
+        def fake_create(preset, **options):
+            seen.update(options)
+            return FakeProvider([Completion(message=Message.assistant("ok"))])
+
+        with mock.patch.object(cli, "create_provider", side_effect=fake_create):
+            code, _, _ = run_cli(
+                ["run", "go", "--workspace", str(self.root), "--cache", "--provider", "anthropic"]
+            )
+        self.assertEqual(code, 0)
+        self.assertTrue(seen.get("cache"))
+
     def test_presets_command_lists_providers(self):
         code, out, _ = run_cli(["presets"])
         self.assertEqual(code, 0)

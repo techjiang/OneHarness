@@ -121,17 +121,55 @@ class Message:
 
 @dataclass(slots=True)
 class Usage:
+    """What one request cost, normalised across five vocabularies.
+
+    `input_tokens` is the whole prompt side, always. `cached_tokens` is how much
+    of it the provider served from its prompt cache -- a subset, never an
+    addition. That normalisation is not cosmetic, because the providers do not
+    agree on it:
+
+    * OpenAI and the OpenAI-shaped services put the cache inside the prompt
+      count (`prompt_tokens_details.cached_tokens` is a slice of
+      `prompt_tokens`; DeepSeek reports `prompt_cache_hit_tokens` the same way);
+    * Anthropic's `input_tokens` counts only the *uncached* input, with
+      `cache_read_input_tokens` and `cache_creation_input_tokens` alongside it;
+    * Gemini's `cachedContentTokenCount` is a slice of `promptTokenCount`;
+    * Bedrock reports `cacheReadInputTokens` / `cacheWriteInputTokens` next to
+      `inputTokens`, like Anthropic.
+
+    Adding the two together naively would double-count on four providers and
+    under-count on the fifth. So every adapter reports the prompt total here and
+    the cached share separately, and nothing above the adapter has to know which
+    wire format it came from.
+    """
+
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
+    # Tokens written *into* the cache. Only the explicit-breakpoint providers
+    # (Anthropic, Bedrock) have this concept; the implicit-cache ones charge
+    # nothing for the write, so 0 there means "not applicable", not "measured 0".
+    cache_write_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def uncached_tokens(self) -> int:
+        """The part of the prompt that was billed at full price."""
+        return max(0, self.input_tokens - self.cached_tokens)
+
+    @property
+    def cache_hit_rate(self) -> float:
+        return self.cached_tokens / self.input_tokens if self.input_tokens else 0.0
+
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             input_tokens=self.input_tokens + other.input_tokens,
             output_tokens=self.output_tokens + other.output_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
         )
 
     def __sub__(self, other: Usage) -> Usage:
@@ -139,14 +177,26 @@ class Usage:
         return Usage(
             input_tokens=self.input_tokens - other.input_tokens,
             output_tokens=self.output_tokens - other.output_tokens,
+            cached_tokens=self.cached_tokens - other.cached_tokens,
+            cache_write_tokens=self.cache_write_tokens - other.cache_write_tokens,
         )
 
-    def as_dict(self) -> dict[str, int]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "total_tokens": self.total_tokens,
         }
+        # Only when there is something to say: a `cache` block of zeros on a
+        # provider that has no cache reads like "caching is broken", and the
+        # absence of the key reads like "nothing was cached", which is true.
+        if self.cached_tokens or self.cache_write_tokens:
+            data["cache"] = {
+                "read_tokens": self.cached_tokens,
+                "write_tokens": self.cache_write_tokens,
+                "hit_rate": round(self.cache_hit_rate, 3),
+            }
+        return data
 
 
 @dataclass(slots=True)

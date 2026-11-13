@@ -36,6 +36,7 @@ class OpenAIProvider(Provider):
         timeout: float = 120.0,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache: bool = False,
     ) -> None:
         super().__init__(model, temperature=temperature, max_tokens=max_tokens)
         self.api_key = api_key
@@ -43,6 +44,12 @@ class OpenAIProvider(Provider):
         self.timeout = timeout
         self.extra_headers = dict(extra_headers or {})
         self.extra_body = dict(extra_body or {})
+        # Accepted and ignored, and that is the correct behaviour rather than a
+        # missing feature: OpenAI, DeepSeek, Groq and the rest of this wire
+        # format cache repeated prefixes without being asked, and there is no
+        # field to put a breakpoint in. Taking the flag keeps `--cache` portable
+        # across presets instead of turning a shared config into a crash.
+        self.cache = cache
 
     def complete(
         self,
@@ -71,10 +78,7 @@ class OpenAIProvider(Provider):
 
         for _, chunk in post_sse(self._endpoint(), payload, self._headers(), timeout=self.timeout):
             if chunk.get("usage"):
-                usage = Usage(
-                    input_tokens=int(chunk["usage"].get("prompt_tokens") or 0),
-                    output_tokens=int(chunk["usage"].get("completion_tokens") or 0),
-                )
+                usage = _usage(chunk["usage"])
             model = chunk.get("model") or model
             choices = chunk.get("choices") or []
             if not choices:
@@ -202,15 +206,28 @@ class OpenAIProvider(Provider):
             )
 
         message = Message.assistant(raw_message.get("content") or "", calls)
-        usage_data = data.get("usage") or {}
-        usage = Usage(
-            input_tokens=int(usage_data.get("prompt_tokens") or 0),
-            output_tokens=int(usage_data.get("completion_tokens") or 0),
-        )
         return Completion(
             message=message,
-            usage=usage,
+            usage=_usage(data.get("usage") or {}),
             model=data.get("model") or self.model,
             stop_reason=choice.get("finish_reason"),
             raw=data,
         )
+
+
+def _usage(raw: dict[str, Any]) -> Usage:
+    """OpenAI-shaped usage, with the cached share pulled out of the prompt count.
+
+    `prompt_tokens_details.cached_tokens` is a *subset* of `prompt_tokens`, so
+    the total needs no arithmetic -- but DeepSeek (same wire format) reports it
+    as a flat `prompt_cache_hit_tokens` instead, and several compatible servers
+    report neither. Reading both spellings and defaulting to 0 keeps one adapter
+    correct for all of them.
+    """
+    details = raw.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens") or raw.get("prompt_cache_hit_tokens") or 0
+    return Usage(
+        input_tokens=int(raw.get("prompt_tokens") or 0),
+        output_tokens=int(raw.get("completion_tokens") or 0),
+        cached_tokens=int(cached),
+    )

@@ -243,6 +243,29 @@ class ConfigTests(unittest.TestCase):
         self.write("[provider]\npreset = 'ollama'\n")
         self.assertEqual(find_config_file(nested), self.root / "oneharness.toml")
 
+    def test_cache_flag_from_the_file(self):
+        config = load_config(self.write("[provider]\npreset = 'anthropic'\ncache = true\n"))
+        self.assertTrue(config.provider.cache)
+        self.assertTrue(config.provider.options()["cache"])
+
+    def test_cache_defaults_to_off_and_is_not_sent(self):
+        """An unset flag must not become `cache=False` on a provider without the kwarg."""
+        config = load_config(self.write(""))
+        self.assertFalse(config.provider.cache)
+        self.assertNotIn("cache", config.provider.options())
+
+    def test_cache_from_the_environment(self):
+        os.environ["ONEHARNESS_CACHE"] = "1"
+        self.assertTrue(load_config(self.write("")).provider.cache)
+        os.environ["ONEHARNESS_CACHE"] = "off"
+        self.assertFalse(load_config(self.write("")).provider.cache)
+
+    def test_cache_env_garbage_is_an_error_not_a_truthy_string(self):
+        os.environ["ONEHARNESS_CACHE"] = "maybe"
+        with self.assertRaises(ConfigError) as ctx:
+            load_config(self.write(""))
+        self.assertIn("true or false", str(ctx.exception))
+
     def test_options_drops_unset(self):
         options = Config().provider.options()
         self.assertNotIn("model", options)

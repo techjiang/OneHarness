@@ -29,6 +29,10 @@ class ProviderConfig:
     # model rather than in environment variables three layers away.
     region: str | None = None
     api_version: str | None = None
+    # Place prompt-cache breakpoints. Only meaningful for the providers whose
+    # `cache_mode` is "explicit" (Anthropic, Bedrock); the rest cache repeated
+    # prefixes on their own and ignore this.
+    cache: bool = False
     extra_headers: dict[str, str] = field(default_factory=dict)
     extra_body: dict[str, Any] = field(default_factory=dict)
 
@@ -43,6 +47,9 @@ class ProviderConfig:
             "timeout": self.timeout,
             "region": self.region,
             "api_version": self.api_version,
+            # Only sent when on: `create_provider` for a preset that does not
+            # accept the keyword would raise, and off is the default anyway.
+            "cache": True if self.cache else None,
             "extra_headers": self.extra_headers or None,
             "extra_body": self.extra_body or None,
         }
@@ -109,6 +116,7 @@ class Config:
                 "max_tokens": self.provider.max_tokens,
                 "region": self.provider.region,
                 "api_version": self.provider.api_version,
+                "cache": self.provider.cache,
             },
             "system": self.system,
             "max_steps": self.max_steps,
@@ -175,6 +183,8 @@ def _merge(config: Config, data: dict[str, Any]) -> Config:
     if unknown:
         raise ConfigError(f"unknown [provider] keys: {', '.join(sorted(unknown))}")
     for key, value in provider_data.items():
+        if key == "cache":
+            value = _flag(value, "[provider] cache")
         setattr(config.provider, key, value)
 
     agent_data = data.get("agent", {})
@@ -220,6 +230,23 @@ def _budget(value: Any, name: str) -> int:
     if budget < 0:
         raise ConfigError(f"{name} must be 0 (unlimited) or a positive token count")
     return budget
+
+
+def _flag(value: Any, name: str) -> bool:
+    """A boolean spelled in a place that can only hold text.
+
+    `ONEHARNESS_CACHE=0` meaning True is the sort of thing that gets noticed
+    three weeks later, so the words are spelled out and anything else is an
+    error rather than a truthy string.
+    """
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be true or false, got {value!r}")
 
 
 def _read_delegate(entry: Any) -> DelegateConfig:
@@ -277,6 +304,7 @@ def _apply_env(config: Config) -> Config:
         "MAX_STEPS": ("max_steps", None),
         "MAX_PARALLEL": ("max_parallel", None),
         "CONTEXT_BUDGET": ("context_budget", None),
+        "CACHE": ("provider", "cache"),
     }
     for suffix, (section, attr) in mapping.items():
         raw = os.environ.get(f"{ENV_PREFIX}{suffix}")
@@ -297,6 +325,8 @@ def _apply_env(config: Config) -> Config:
                 if value < 1:
                     raise ConfigError(f"{ENV_PREFIX}{suffix} must be at least 1")
                 config.max_parallel = value
+        elif suffix == "CACHE":
+            config.provider.cache = _flag(raw, f"{ENV_PREFIX}{suffix}")
         elif section == "provider":
             setattr(config.provider, attr, raw)
         else:

@@ -51,6 +51,11 @@ class Step:
     # How long the request ran before its first byte of anything came back.
     # Only streaming can observe it; a blocking request has no "first".
     first_token_seconds: float | None = None
+    # The estimator's own count of the request that went out on the wire. Kept
+    # so the run can compare it against the provider's `input_tokens` at the
+    # end: an estimate nobody ever checks against reality is a number that only
+    # agrees with itself.
+    prompt_tokens_estimated: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -62,6 +67,7 @@ class Step:
             "model_seconds": round(self.model_seconds, 3),
             "tool_seconds": round(self.tool_seconds, 3),
             "model_requests": self.model_requests,
+            "prompt_tokens_estimated": self.prompt_tokens_estimated,
         }
         if self.first_token_seconds is not None:
             data["first_token_seconds"] = round(self.first_token_seconds, 3)
@@ -82,6 +88,8 @@ class ModelCall:
     seconds: float = 0.0
     requests: int = 0
     first_token_seconds: float | None = None
+    # Estimated tokens of the list that was actually sent, after any trimming.
+    prompt_tokens_estimated: int = 0
 
 
 @dataclass(slots=True)
@@ -247,6 +255,7 @@ class Agent:
                 model_seconds=turn.seconds,
                 model_requests=turn.requests,
                 first_token_seconds=turn.first_token_seconds,
+                prompt_tokens_estimated=turn.prompt_tokens_estimated,
             )
             steps.append(step)
             self._emit(
@@ -474,6 +483,9 @@ class Agent:
                 seconds=spent,
                 requests=requests,
                 first_token_seconds=first_token,
+                # Counted here, not from `messages`: on a trimmed run the two
+                # differ, and the provider only ever saw this one.
+                prompt_tokens_estimated=context_module.estimate(outgoing, list(specs)),
             )
         raise AssertionError("unreachable: the loop returns or raises")
 

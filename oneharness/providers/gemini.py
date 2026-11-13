@@ -39,6 +39,7 @@ class GeminiProvider(Provider):
         timeout: float = 120.0,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
+        cache: bool = False,
     ) -> None:
         super().__init__(model, temperature=temperature, max_tokens=max_tokens)
         self.api_key = api_key
@@ -46,6 +47,10 @@ class GeminiProvider(Provider):
         self.timeout = timeout
         self.extra_headers = dict(extra_headers or {})
         self.extra_body = dict(extra_body or {})
+        # Gemini's implicit cache needs no breakpoint; a request carrying one
+        # would be inventing a field. The flag is accepted so `--cache` can be
+        # set once in a config file and survive a change of preset.
+        self.cache = cache
 
     def complete(
         self,
@@ -245,7 +250,10 @@ class GeminiProvider(Provider):
     def _usage(meta: Any) -> Usage | None:
         if not isinstance(meta, dict):
             return None
+        # `cachedContentTokenCount` is a slice of `promptTokenCount` here, so
+        # the total needs no adjustment -- unlike Anthropic, where it would.
         return Usage(
             input_tokens=int(meta.get("promptTokenCount") or 0),
             output_tokens=int(meta.get("candidatesTokenCount") or 0),
+            cached_tokens=int(meta.get("cachedContentTokenCount") or 0),
         )

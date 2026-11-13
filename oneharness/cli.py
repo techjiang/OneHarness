@@ -59,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
             help="token ceiling for one request; old tool results are elided to fit",
         )
         sub.add_argument(
+            "--cache",
+            action="store_true",
+            help="place prompt-cache breakpoints (Anthropic/Bedrock); others cache on their own",
+        )
+        sub.add_argument(
             "--delegate",
             action="store_true",
             help="expose `delegate` / `delegate_many` tools that hand work to sub agents",
@@ -151,6 +156,8 @@ def _resolve_config(args: argparse.Namespace) -> Config:
         if args.context_budget < 0:
             raise ConfigError("--context-budget must be 0 (unlimited) or a positive token count")
         config.context_budget = args.context_budget
+    if getattr(args, "cache", False):
+        config.provider.cache = True
     if getattr(args, "delegate", False):
         config.delegate.enabled = True
     return config
@@ -539,6 +546,7 @@ def _report_timing(result: AgentResult, delegation: dict[str, Any] | None = None
             "(streamed steps only)",
             file=sys.stderr,
         )
+
     slowest = timing["slowest_step"]
     if slowest is not None:
         print(
@@ -565,6 +573,58 @@ def _report_timing(result: AgentResult, delegation: dict[str, Any] | None = None
                 f"= {output / model:.0f} tok/s",
                 file=sys.stderr,
             )
+
+
+def _report_cache(result: AgentResult, *, quiet: bool = False) -> None:
+    """How much of the prompt came back from the cache, when any did.
+
+    Silence when nothing was cached, on purpose: a `cache: 0 of 0` line would
+    show up on every run against a provider that has no cache at all, and a
+    number that is always zero stops being read.
+    """
+    if quiet:
+        return
+    usage = result.usage
+    if not usage.cached_tokens and not usage.cache_write_tokens:
+        return
+    line = (
+        f"[cache] {usage.cached_tokens} of {usage.input_tokens} prompt tokens read "
+        f"({usage.cache_hit_rate * 100:.0f}%)"
+    )
+    if usage.cache_write_tokens:
+        line += f", {usage.cache_write_tokens} written"
+    print(line, file=sys.stderr)
+
+
+def _report_estimate(result: AgentResult, *, quiet: bool = False) -> None:
+    """The estimator against the provider's own prompt count, summed over the run.
+
+    This is the only place the two can meet. `tokens.py` counts characters; the
+    provider counts tokens. Independent sources are what makes the comparison
+    worth printing at all -- and v1.2 claimed a 5% average error, so here is
+    that claim being checked against a real counter rather than a frozen
+    fixture.
+
+    Summed over steps, and each step contributes the estimate of the list it
+    actually sent (after trimming). Comparing a trimmed request against the
+    untrimmed transcript would produce a gap that is not the estimator's fault.
+
+    Skipped when nothing was estimated or nothing was reported: a provider that
+    does not count tokens cannot disagree with anything.
+    """
+    if quiet:
+        return
+    estimated = sum(step.prompt_tokens_estimated for step in result.steps)
+    reported = result.usage.input_tokens
+    if estimated <= 0 or reported <= 0:
+        return
+    ratio = estimated / reported
+    verdict = f"{abs(ratio - 1) * 100:.0f}% off" if abs(ratio - 1) > 0.02 else "within 2%"
+    print(
+        f"[estimate] {estimated} token(s) estimated vs {reported} counted by the provider "
+        f"over {len(result.steps)} step(s): {verdict}",
+        file=sys.stderr,
+    )
 
 
 def _seconds(value: float) -> str:
@@ -627,6 +687,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     _report(result, args.json, stream and observer.printed_text, delegation)
     if args.timing and not args.json:
         _report_timing(result, delegation)
+    _report_cache(result, quiet=args.quiet)
+    if args.timing and not args.json:
+        # Diagnosis, not a headline: `--timing` is where numbers about numbers
+        # live. The cache line above stays unconditional because it is about
+        # money, and `--json` carries both in `usage`.
+        _report_estimate(result, quiet=args.quiet)
     _report_delegation(delegator, args.quiet)
     if tape is not None and not args.quiet:
         _report_tape(tape)
