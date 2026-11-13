@@ -21,6 +21,7 @@ from oneharness.types import (
     ToolCall,
     ToolResult,
     Usage,
+    mark_incomplete_arguments,
 )
 
 # The one interruption that is a human decision rather than a failure; the CLI
@@ -109,6 +110,10 @@ class AgentResult:
     # is what the model had already said out loud; throwing it away because the
     # connection died would discard the only thing that arrived.
     interrupted: str | None = None
+    # Why the provider stopped mid-thought when it reached its output limit.
+    # Separate from `interrupted` because the answer is not damaged: it is
+    # finished, and it is not finished saying everything.
+    cut_off: str | None = None
     # Wall clock of the whole run, measured by the loop itself.
     seconds: float = 0.0
 
@@ -179,6 +184,8 @@ class AgentResult:
             data["trim"] = self.trim
         if self.interrupted:
             data["interrupted"] = self.interrupted
+        if self.cut_off:
+            data["cut_off"] = self.cut_off
         data["timing"] = self.timing
         return data
 
@@ -238,6 +245,7 @@ class Agent:
         final_text = ""
         trim: context_module.Trim | None = None
         interrupted: str | None = None
+        cut_off: str | None = None
         run_started = time.monotonic()
 
         for index in range(self.max_steps):
@@ -290,6 +298,46 @@ class Agent:
                 )
                 break
 
+            if completion.cut_off:
+                # A turn that ran out of output budget is not a turn that
+                # finished -- whatever it was in the middle of. Until v1.7 the
+                # loop only asked "did it ask for a tool", so a final answer
+                # cut at `max_tokens` came back as `done` with half a sentence
+                # and exit code 0, and a cut-off tool call was fed to a tool
+                # with half its JSON.
+                #
+                # The turn still runs its tools when it has them: a request has
+                # to be answered, and an assistant message declaring calls with
+                # no `tool` messages behind it is rejected by every provider.
+                # Only the call that was still being written is touched, and
+                # its arguments_error says why, which the registry turns into an
+                # error result the model can retry with something shorter.
+                cut_off = completion.cut_off
+                if completion.tool_calls:
+                    calls = mark_incomplete_arguments(list(completion.tool_calls))
+                    completion.message.tool_calls = calls
+                    for call in calls:
+                        if call.arguments_error:
+                            self._emit(
+                                {
+                                    "type": "tool_call_incomplete",
+                                    "step": index + 1,
+                                    "id": call.id,
+                                    "name": call.name,
+                                    "reason": call.arguments_error,
+                                }
+                            )
+                stopped = "truncated"
+                self._emit(
+                    {
+                        "type": "cut_off",
+                        "step": index + 1,
+                        "reason": cut_off,
+                        "stop_reason": completion.stop_reason,
+                        "chars": len(completion.text),
+                    }
+                )
+
             if not completion.tool_calls:
                 # The step that answers is the one people want the duration of,
                 # and it used to be the only one still reporting 0.0 -- the
@@ -297,7 +345,10 @@ class Agent:
                 # reaches.
                 step.seconds = time.monotonic() - started
                 self._emit_step_end(index + 1, step, tool_calls=0)
-                stopped = "done"
+                # The answer branch closes the run with whatever the verdict
+                # already is: `truncated` was decided above and must survive,
+                # and "the model chose to stop" is only true when it did.
+                stopped = "truncated" if completion.cut_off else "done"
                 break
 
             tools_started = time.monotonic()
@@ -310,8 +361,14 @@ class Agent:
                 messages.append(result.as_message())
             step.seconds = time.monotonic() - started
             self._emit_step_end(index + 1, step, tool_calls=len(completion.tool_calls))
+            if cut_off:
+                # It ran the tools of a turn it never got to finish writing.
+                # The next request would ask the model to continue from a
+                # half-written call, so the run stops here with the reason it
+                # actually stopped -- there is nothing wrong with the loop, and
+                # there is nothing more it can do about a budget it cannot see.
+                break
         else:
-            # Budget exhausted while the model still wanted tools.
             stopped = "max_steps"
             self._emit({"type": "max_steps", "steps": self.max_steps})
 
@@ -324,6 +381,7 @@ class Agent:
             model=getattr(self.provider, "model", None),
             trim=trim.as_dict() if trim is not None and trim.changed else None,
             interrupted=interrupted,
+            cut_off=cut_off,
             seconds=time.monotonic() - run_started,
         )
 
@@ -549,6 +607,15 @@ class Agent:
             finished = self._truncated("".join(text), STREAM_ENDED_EARLY)
         if not finished.message.content and text:
             finished.message = Message.assistant("".join(text), finished.message.tool_calls)
+        # The call the model was still writing when the stream stopped. It stays
+        # declared (the model did ask for it) with its arguments called out as
+        # incomplete: silently dropping it would send an assistant turn with no
+        # text and no calls, which reads to the next request as "the model said
+        # nothing" -- a different and much quieter claim than "it was cut off".
+        if finished.truncated and finished.message.tool_calls:
+            finished.message.tool_calls = mark_incomplete_arguments(
+                list(finished.message.tool_calls)
+            )
         return finished, first_token
 
     @staticmethod

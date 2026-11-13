@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from oneharness import cli
+from oneharness.providers.base import Provider
 from oneharness.tools import tool
 from oneharness.types import Completion, Message, ToolCall, Usage
 
@@ -29,6 +30,15 @@ def run_cli(argv):
     with redirect_stdout(out), redirect_stderr(err):
         code = cli.main(argv)
     return code, out.getvalue(), err.getvalue()
+
+
+class _Finish(Provider):
+    """Only `_finish` is used; the abstract method never runs."""
+
+    name = "fake"
+
+    def complete(self, messages, tools=None):  # pragma: no cover - not called
+        raise AssertionError("not used")
 
 
 class CliTests(unittest.TestCase):
@@ -509,6 +519,22 @@ class CliTests(unittest.TestCase):
             )
         self.assertEqual(code, 0)
         self.assertIn("overlapped", err)
+
+    def test_a_cut_off_answer_exits_non_zero_and_says_why(self):
+        # The text is printed (it is the only copy of it), and the exit code is
+        # the part a script reads: a half answer that exits 0 is a half answer
+        # that gets committed.
+        # The provider is what reads the finish reason, so the fake keeps its
+        # method and only its `complete` is scripted.
+        cut = Completion(message=Message.assistant("The timeout is"))
+        cut = _Finish("fake-1")._finish(cut, "length")
+        provider = FakeProvider([cut])
+        with mock.patch.object(cli, "create_provider", return_value=provider):
+            code, out, err = run_cli(["run", "go", "--workspace", str(self.root)])
+        self.assertEqual(code, 1)
+        self.assertEqual(out.strip(), "The timeout is")
+        self.assertIn("output limit", err)
+        self.assertNotIn("interrupted", err)
 
     def test_parse_error_for_unknown_flag(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:

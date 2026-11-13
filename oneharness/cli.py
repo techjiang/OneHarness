@@ -471,6 +471,16 @@ def _report(
         # the run was going; repeating it here would just be the same sentence
         # twice. What matters at the end is that the answer is not whole.
         print("[the answer above is incomplete]", file=sys.stderr)
+    elif result.cut_off:
+        # Same closing line, different fact: this answer was not damaged, it
+        # stopped at a budget. The instruction that fixes it is on the other
+        # side of the wire -- a bigger `max_tokens`, or an answer asked for in
+        # pieces -- so saying "incomplete" alone would send people looking for
+        # a bug.
+        print(
+            f"[the answer above stopped at the output limit ({result.cut_off})]",
+            file=sys.stderr,
+        )
 
 
 def _report_timing(result: AgentResult, delegation: dict[str, Any] | None = None) -> None:

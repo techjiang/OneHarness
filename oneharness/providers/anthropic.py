@@ -146,16 +146,20 @@ class AnthropicProvider(Provider):
 
         yield StreamEvent(
             kind="done",
-            completion=Completion(
-                message=Message.assistant("".join(text), calls),
-                usage=usage,
-                model=model,
-                stop_reason=stop_reason,
-                raw={"streamed": True},
-                # `stop_reason` rides in `message_delta`; if it never came, the
-                # body was cut after `content_block_delta` and the text is real
-                # but unfinished.
-                truncated=None if stop_reason else STREAM_ENDED_EARLY,
+            completion=self._finish(
+                Completion(
+                    message=Message.assistant("".join(text), calls),
+                    usage=usage,
+                    model=model,
+                    raw={"streamed": True},
+                    # `stop_reason` rides in `message_delta`; if it never came,
+                    # the body was cut after `content_block_delta` and the text
+                    # is real but unfinished. `stop_reason: max_tokens` is the
+                    # other way to stop mid-sentence, and it is not truncation:
+                    # the message is whole, the answer is not.
+                    truncated=None if stop_reason else STREAM_ENDED_EARLY,
+                ),
+                stop_reason,
             ),
         )
 
@@ -260,12 +264,14 @@ class AnthropicProvider(Provider):
                     )
                 )
 
-        return Completion(
-            message=Message.assistant("".join(text_parts), calls),
-            usage=_usage(data.get("usage") or {}),
-            model=data.get("model") or self.model,
-            stop_reason=data.get("stop_reason"),
-            raw=data,
+        return self._finish(
+            Completion(
+                message=Message.assistant("".join(text_parts), calls),
+                usage=_usage(data.get("usage") or {}),
+                model=data.get("model") or self.model,
+                raw=data,
+            ),
+            data.get("stop_reason"),
         )
 
 

@@ -280,3 +280,93 @@ class GeminiStreamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutputLimitOnTheWireTests(unittest.TestCase):
+    """`finish_reason: length` is a word each provider says in its own dialect.
+
+    Reading it is the whole difference between "the model finished" and "the
+    model was cut off", and there is no other signal: the HTTP status is 200,
+    the JSON is well formed, and the stream reached its own terminal marker.
+    These tests go through the real wire formats rather than the shared helper,
+    because a helper that is only ever called by tests proves nothing.
+    """
+
+    def test_openai_length_is_not_a_finished_answer(self):
+        events = [
+            (None, openai_chunk("The timeout is 5 seconds, and if you")),
+            (None, openai_chunk(finish="length")),
+        ]
+        with SSERecorder(events) as server:
+            provider = OpenAIProvider("gpt", api_key="sk", base_url=server.url)
+            done = list(provider.stream([Message.user("hi")]))[-1].completion
+
+        self.assertEqual(done.stop_reason, "length")
+        self.assertIsNone(done.truncated)  # the stream ended exactly as intended
+        self.assertIn("output token limit", done.cut_off)
+
+    def test_openai_stop_is_a_finished_answer(self):
+        events = [(None, openai_chunk("done.")), (None, openai_chunk(finish="stop"))]
+        with SSERecorder(events) as server:
+            provider = OpenAIProvider("gpt", api_key="sk", base_url=server.url)
+            done = list(provider.stream([Message.user("hi")]))[-1].completion
+        self.assertIsNone(done.cut_off)
+
+    def test_anthropic_max_tokens(self):
+        events = [
+            ("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "the answer is"},
+                },
+            ),
+            ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+        ]
+        with SSERecorder(events) as server:
+            provider = AnthropicProvider("c", api_key="k", base_url=server.url)
+            done = list(provider.stream([Message.user("hi")]))[-1].completion
+        self.assertEqual(done.stop_reason, "max_tokens")
+        self.assertIn("output token limit", done.cut_off)
+
+    def test_anthropic_end_turn_is_fine(self):
+        events = [
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "ok"},
+                },
+            ),
+            ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+        ]
+        with SSERecorder(events) as server:
+            provider = AnthropicProvider("c", api_key="k", base_url=server.url)
+            done = list(provider.stream([Message.user("hi")]))[-1].completion
+        self.assertIsNone(done.cut_off)
+
+    def test_gemini_max_tokens_and_a_half_written_call(self):
+        # Gemini reports the same fact in capitals, and a cut can land inside a
+        # function call: the arguments it dumped so carefully did not finish.
+        chunk = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [{"functionCall": {"name": "write_file", "args": {"path": "a"}}}]
+                    },
+                    "finishReason": "MAX_TOKENS",
+                }
+            ],
+        }
+        with SSERecorder([(None, chunk)]) as server:
+            provider = GeminiProvider("gemini-x", api_key="k", base_url=server.url)
+            done = list(provider.stream([Message.user("hi")]))[-1].completion
+        self.assertEqual(done.stop_reason, "MAX_TOKENS")
+        self.assertIn("output token limit", done.cut_off)
+        # Gemini is the one provider whose function-call payload is a whole
+        # object, so an interrupted one is still valid JSON -- the cut cannot be
+        # seen in the arguments and has to be reported by the reason instead.
+        self.assertIsNone(done.tool_calls[0].arguments_error)

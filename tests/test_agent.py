@@ -40,6 +40,12 @@ def add(a: int, b: int) -> int:
     return a + b
 
 
+@tool
+def write(path: str, content: str) -> str:
+    """Pretend to write a file: the point is the arguments, not the disk."""
+    return f"wrote {len(content)} chars to {path}"
+
+
 class AgentLoopTests(unittest.TestCase):
     def test_plain_answer_without_tools(self):
         provider = ScriptedProvider(text_reply("hello"))
@@ -420,6 +426,126 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(payload["stopped_reason"], "done")
         self.assertEqual(payload["steps"][0]["tool_results"][0]["content"], "3")
         self.assertEqual(payload["usage"]["total_tokens"], 30)
+
+
+class OutputLimitTests(unittest.TestCase):
+    """A turn that ran out of output budget is not a turn that finished.
+
+    Every provider says so in one word (`length`, `max_tokens`, `MAX_TOKENS`)
+    and nothing in this harness used to read that word: the loop only asked
+    "did it ask for a tool", so a half-sentence arrived with `stopped_reason:
+    done`, exit code 0 and no warning anywhere. This is the one failure whose
+    HTTP status, JSON shape and stream terminator are all correct.
+    """
+
+    def finished(self, stop_reason, text="The timeout is 5 seconds, and if you"):
+        call = ScriptedProvider(text_reply(text))
+        call.script[0] = call._finish(call.script[0], stop_reason)
+        return call
+
+    def test_a_cut_off_answer_is_not_done(self):
+        for reason in ("length", "max_tokens", "MAX_TOKENS"):
+            with self.subTest(stop_reason=reason):
+                result = Agent(self.finished(reason)).run("go")
+                self.assertEqual(result.stopped_reason, "truncated")
+                self.assertFalse(result.ok)
+                # The text still comes back: it is the only copy of it.
+                self.assertEqual(result.text, "The timeout is 5 seconds, and if you")
+                self.assertIn(reason, result.cut_off)
+
+    def test_a_normal_stop_stays_done(self):
+        for reason in ("stop", "end_turn", "STOP", "tool_calls", None):
+            with self.subTest(stop_reason=reason):
+                result = Agent(self.finished(reason)).run("go")
+                self.assertEqual(result.stopped_reason, "done")
+                self.assertTrue(result.ok)
+                self.assertIsNone(result.cut_off)
+
+    def test_the_limit_is_announced_while_it_happens(self):
+        events = []
+        Agent(self.finished("length"), on_event=events.append).run("go")
+        cut = [event for event in events if event["type"] == "cut_off"]
+        self.assertEqual(len(cut), 1)
+        self.assertEqual(cut[0]["stop_reason"], "length")
+        self.assertEqual(cut[0]["chars"], len("The timeout is 5 seconds, and if you"))
+        # No `interrupted`: nothing broke, the budget ran out.
+        self.assertNotIn("interrupted", [event["type"] for event in events])
+
+    def test_json_says_why_and_keeps_it_out_of_interrupted(self):
+        payload = Agent(self.finished("length")).run("go").as_dict()
+        self.assertEqual(payload["stopped_reason"], "truncated")
+        self.assertIn("length", payload["cut_off"])
+        self.assertNotIn("interrupted", payload)
+        self.assertNotIn("cut_off", Agent(self.finished("stop")).run("go").as_dict())
+
+    def test_a_cut_off_tool_call_is_declared_but_flagged(self):
+        # The model was halfway through writing the arguments when it ran out.
+        # The call stays (the model did ask for it) and says what is wrong with
+        # it, so the model gets a chance to retry with shorter arguments --
+        # dropping it would look like the model said nothing at all.
+        half = Completion(
+            message=Message.assistant(
+                "",
+                [
+                    ToolCall.from_raw(
+                        call_id="c1",
+                        name="write",
+                        arguments={"path": "a.conf", "content": "timeout="},
+                    )
+                ],
+            ),
+            usage=Usage(10, 5),
+        )
+        # A parsed call whose transport went out on the wire with half its JSON:
+        # that is what `from_raw` produces from a stitched, cut-off stream.
+        half.message.tool_calls[0].raw_arguments = '{"path": "a.conf", "content": "timeout='
+        half.message.tool_calls[0].id = "c1"
+        provider = ScriptedProvider(half)
+        provider.script[0] = provider._finish(provider.script[0], "length")
+        events = []
+        result = Agent(provider, [write], on_event=events.append).run("go")
+
+        # The call was executed rather than dropped: an assistant turn that
+        # declares a call with no result behind it is a request every provider
+        # rejects, and there is no way to answer it.
+        fed_back = [m for m in result.messages if m.role == "tool"]
+        self.assertEqual(len(fed_back), 1)
+        self.assertTrue(fed_back[0].is_error)
+        self.assertIn("cut off", fed_back[0].content)
+        # ...and the run says what happened instead of reporting success.
+        self.assertEqual(result.stopped_reason, "truncated")
+        self.assertIn("length", result.cut_off)
+        # The event names the call, so a watcher can tell which one to shorten.
+        incomplete = [e for e in events if e["type"] == "tool_call_incomplete"]
+        self.assertEqual([e["name"] for e in incomplete], ["write"])
+        self.assertEqual([e["type"] for e in events].count("cut_off"), 1)
+
+    def test_a_parsed_call_survives_an_earlier_completion(self):
+        # `length` can land on a turn that already declared a complete call and
+        # then kept writing prose. The call is not the casualty then, and
+        # inventing an error for it would lose a working request.
+        provider = ScriptedProvider(
+            Completion(
+                message=Message.assistant(
+                    "Let me check that file.",
+                    [ToolCall.from_raw(call_id="c1", name="add", arguments={"a": 1, "b": 2})],
+                ),
+                usage=Usage(10, 5),
+            ),
+            text_reply("done"),
+        )
+        provider.script[0] = provider._finish(provider.script[0], "length")
+        result = Agent(provider, [add]).run("go")
+        # It ran (there is a `tool` message) with the arguments the model wrote,
+        # and then stopped: continuing would ask the model to carry on from a
+        # turn whose budget already ran out.
+        self.assertEqual([m.role for m in result.messages], ["user", "assistant", "tool"])
+        self.assertEqual(result.steps[0].tool_results[0].content, "3")
+        self.assertIsNone(result.messages[1].tool_calls[0].arguments_error)
+        # The run is still marked: it hit the limit mid-sentence, and the fact
+        # that the call happened to be complete does not make the answer whole.
+        self.assertEqual(result.stopped_reason, "truncated")
+        self.assertIn("length", result.cut_off)
 
 
 if __name__ == "__main__":

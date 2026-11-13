@@ -122,15 +122,19 @@ class GeminiProvider(Provider):
         ]
         yield StreamEvent(
             kind="done",
-            completion=Completion(
-                message=Message.assistant("".join(text), calls),
-                usage=usage,
-                model=model,
-                stop_reason=stop_reason,
-                raw={"streamed": True},
-                # Gemini puts `finishReason` on the last candidate chunk; no
-                # reason means the stream stopped before it finished.
-                truncated=None if stop_reason else STREAM_ENDED_EARLY,
+            completion=self._finish(
+                Completion(
+                    message=Message.assistant("".join(text), calls),
+                    usage=usage,
+                    model=model,
+                    raw={"streamed": True},
+                    # Gemini puts `finishReason` on the last candidate chunk; no
+                    # reason means the stream stopped before it finished.
+                    # `finishReason: MAX_TOKENS` is the reason that did arrive,
+                    # and it means the same thing Anthropic's `max_tokens` does.
+                    truncated=None if stop_reason else STREAM_ENDED_EARLY,
+                ),
+                stop_reason,
             ),
         )
 
@@ -238,12 +242,14 @@ class GeminiProvider(Provider):
                     )
                 )
 
-        return Completion(
-            message=Message.assistant("".join(texts), calls),
-            usage=self._usage(data.get("usageMetadata")) or Usage(),
-            model=data.get("modelVersion") or self.model,
-            stop_reason=candidate.get("finishReason"),
-            raw=data,
+        return self._finish(
+            Completion(
+                message=Message.assistant("".join(texts), calls),
+                usage=self._usage(data.get("usageMetadata")) or Usage(),
+                model=data.get("modelVersion") or self.model,
+                raw=data,
+            ),
+            candidate.get("finishReason"),
         )
 
     @staticmethod

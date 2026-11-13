@@ -128,16 +128,23 @@ class OpenAIProvider(Provider):
         )
         yield StreamEvent(
             kind="done",
-            completion=Completion(
-                message=message,
-                usage=usage,
-                model=model,
-                stop_reason=stop_reason,
-                raw={"streamed": True},
-                # No `finish_reason` means the body ended without the provider
-                # saying it was done. Saying `done` here would be this adapter
-                # inventing an ending the server never sent.
-                truncated=None if stop_reason else STREAM_ENDED_EARLY,
+            completion=self._finish(
+                Completion(
+                    message=message,
+                    usage=usage,
+                    model=model,
+                    raw={"streamed": True},
+                    # No `finish_reason` means the body ended without the
+                    # provider saying it was done. Saying `done` here would be
+                    # this adapter inventing an ending the server never sent.
+                    #
+                    # `finish_reason: length` is the opposite case and used to
+                    # land in the same silent place: the server did send an
+                    # ending, it just was not the model's. That one is a
+                    # `cut_off`, not a truncation -- the bytes are all there.
+                    truncated=None if stop_reason else STREAM_ENDED_EARLY,
+                ),
+                stop_reason,
             ),
         )
 
@@ -206,12 +213,14 @@ class OpenAIProvider(Provider):
             )
 
         message = Message.assistant(raw_message.get("content") or "", calls)
-        return Completion(
-            message=message,
-            usage=_usage(data.get("usage") or {}),
-            model=data.get("model") or self.model,
-            stop_reason=choice.get("finish_reason"),
-            raw=data,
+        return self._finish(
+            Completion(
+                message=message,
+                usage=_usage(data.get("usage") or {}),
+                model=data.get("model") or self.model,
+                raw=data,
+            ),
+            choice.get("finish_reason"),
         )
 
 

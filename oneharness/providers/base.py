@@ -6,7 +6,12 @@ import abc
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from oneharness.types import Completion, Message, StreamEvent
+from oneharness.types import (
+    Completion,
+    Message,
+    StreamEvent,
+    cut_off_reason,
+)
 
 
 class Provider(abc.ABC):
@@ -33,6 +38,21 @@ class Provider(abc.ABC):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+
+    def _finish(self, completion: Completion, stop_reason: str | None) -> Completion:
+        """Close a completion by reading the one word that means "I was cut off".
+
+        Every adapter has the reason in hand and every adapter used to keep it
+        in `stop_reason` for nobody to look at. A turn that ran out of output
+        is the quietest failure this harness can have: the HTTP status is 200,
+        the JSON parses, `truncated` stays empty because the stream ended
+        exactly where the server meant it to, and the loop reports success on
+        half a sentence. Calling this before returning makes the reason a
+        decision instead of a field.
+        """
+        completion.stop_reason = stop_reason
+        completion.cut_off = cut_off_reason(self.name, stop_reason)
+        return completion
 
     @abc.abstractmethod
     def complete(

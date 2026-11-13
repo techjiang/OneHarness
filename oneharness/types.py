@@ -211,6 +211,12 @@ class Completion:
     # Set when the stream ended before the provider said it was done. The text
     # is whatever had already been produced, which is worth more than nothing.
     truncated: str | None = None
+    # Set when the provider says it stopped because it ran out of output
+    # budget rather than because it was finished. This is a complete response,
+    # not a broken one -- which is exactly why it used to be the quietest
+    # failure in the loop: `finish_reason: length` sets no `truncated`, the
+    # answer parses, and the run reports success with half a sentence.
+    cut_off: str | None = None
 
     @property
     def text(self) -> str:
@@ -266,6 +272,63 @@ class ToolResult:
             "is_error": self.is_error,
             "seconds": round(self.seconds, 3),
         }
+
+
+# The five providers do not agree on the word for "I ran out of output", and
+# the word is the whole signal: OpenAI-shaped services say `length` (DeepSeek
+# keeps it), Anthropic says `max_tokens`, Gemini says `MAX_TOKENS`, and Bedrock
+# -- being the odd one out -- says `max_tokens` too. Matched case-insensitively
+# so one set covers both spellings.
+CUT_OFF_REASONS = frozenset({"length", "max_tokens"})
+
+# The tool call that was being written when the output ran out. Arguments are
+# JSON, so the half that arrived does not parse. Marking it here rather than
+# dropping it keeps the declaration (the model asked for this) and states the
+# defect (the arguments never finished), which is a true pair of facts.
+INCOMPLETE_ARGUMENTS = "tool arguments were cut off by the output limit"
+
+
+def stops_for_length(stop_reason: str | None) -> bool:
+    """True when a finish reason means "out of budget", not "finished"."""
+    if not stop_reason:
+        return False
+    return stop_reason.strip().lower().replace("-", "_") in CUT_OFF_REASONS
+
+
+def cut_off_reason(provider: str, stop_reason: str | None) -> str | None:
+    """The sentence for a turn the provider ended at its output limit."""
+    if not stops_for_length(stop_reason):
+        return None
+    return (
+        f"{provider} stopped at the output token limit (stop_reason={stop_reason}): "
+        "this response is complete as a response and unfinished as an answer"
+    )
+
+
+def mark_incomplete_arguments(calls: list[ToolCall]) -> list[ToolCall]:
+    """Flag the last call when its argument JSON does not parse.
+
+    Only the call being written can be half-done: the ones before it were
+    closed before this one started. The test is whether the JSON *parses*, not
+    whether it looks short: a cut can land right after the closing quote of a
+    value, and `{"path": "app.conf"` is missing only one brace.
+    """
+    if not calls:
+        return calls
+    last = calls[-1]
+    text = (last.raw_arguments or "").strip()
+    if not last.arguments_error and text and _parses(text):
+        return calls
+    last.arguments_error = INCOMPLETE_ARGUMENTS
+    return calls
+
+
+def _parses(text: str) -> bool:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(value, dict)
 
 
 def dumps(value: Any) -> str:

@@ -155,15 +155,19 @@ class BedrockProvider(Provider):
         ]
         yield StreamEvent(
             kind="done",
-            completion=Completion(
-                message=Message.assistant("".join(text), assembled),
-                usage=usage,
-                model=model,
-                stop_reason=stop_reason,
-                raw={"streamed": True},
-                # `messageStop` is the last frame of a complete turn; without it
-                # the event stream ended mid-sentence.
-                truncated=None if stop_reason else STREAM_ENDED_EARLY,
+            completion=self._finish(
+                Completion(
+                    message=Message.assistant("".join(text), assembled),
+                    usage=usage,
+                    model=model,
+                    raw={"streamed": True},
+                    # `messageStop` is the last frame of a complete turn;
+                    # without it the event stream ended mid-sentence.
+                    # `stopReason: max_tokens` is a frame that did arrive -- the
+                    # turn is complete and the answer is not.
+                    truncated=None if stop_reason else STREAM_ENDED_EARLY,
+                ),
+                stop_reason,
             ),
         )
 
@@ -297,12 +301,14 @@ class BedrockProvider(Provider):
                     )
                 )
 
-        return Completion(
-            message=Message.assistant("".join(texts), calls),
-            usage=self._usage(data.get("usage")) or Usage(),
-            model=data.get("model") or self.model,
-            stop_reason=data.get("stopReason"),
-            raw=data,
+        return self._finish(
+            Completion(
+                message=Message.assistant("".join(texts), calls),
+                usage=self._usage(data.get("usage")) or Usage(),
+                model=data.get("model") or self.model,
+                raw=data,
+            ),
+            data.get("stopReason"),
         )
 
     @staticmethod

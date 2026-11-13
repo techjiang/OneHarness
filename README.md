@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做十件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做十四件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -29,7 +29,9 @@
    进程树，`stderr` 和 `stdout` 按真实顺序混在一条管道里，二进制输出不当异常，
    刷屏的输出边读边裁（保留头尾）；
 13. 不把「服务器死了」报成「超时了」：MCP server 崩了立刻说崩了、带上它自己那句
-   遗言，还顺手回它发过来的请求；`close()` 等的是关掉，不是等它自己走。
+   遗言，还顺手回它发过来的请求；`close()` 等的是关掉，不是等它自己走；
+14. 不把「模型话没说完」报成「答完了」：五家用四个词说同一件事（`length` /
+   `max_tokens` / `MAX_TOKENS`），读完那个词再决定这次 run 算不算成功。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -49,10 +51,12 @@ OneHarness 把这些差异收敛在 `providers/` 里，上层只有一个 `Provi
 ```python
 from oneharness import Agent, Registry, create_provider, tool
 
+
 @tool
 def add(a: int, b: int) -> int:
     """把两个整数相加。"""
     return a + b
+
 
 agent = Agent(create_provider("openai", model="gpt-4o-mini"), Registry([add]))
 result = agent.run("37 加 58 等于多少？")
@@ -134,7 +138,8 @@ $ oneharness run "整理这次改动" --timing       # 每步拆成「等模型�
 
 父 agent 没有委派时这个字段不出现——空对象比缺字段更容易让人以为坏掉了。
 
-退出码：`0` 正常收尾，`1` 配置/网络/工具链出错或步数耗尽，`2` 参数错误（argparse 惯例）。
+退出码：`0` 正常收尾，`1` 配置/网络/工具链出错、步数耗尽或回答撞上输出上限，
+`2` 参数错误（argparse 惯例）。
 
 ## 流式输出
 
@@ -205,6 +210,78 @@ Ctrl-C 同理，只是原因写作 `interrupted by user (Ctrl-C)`、退出码 13
 判断「断了」的依据是 provider 自己的收尾标记，不是「读完了」：OpenAI 的 `finish_reason`、
 Anthropic 的 `stop_reason`、Bedrock 的 `messageStop`、Gemini 的 `finishReason`。少一个都算截断——
 适配器不再替服务器编一个「正常结束」，因为它不知道那是不是正常结束。
+
+## 输出上限：唯一一个报成成功的失败
+
+模型的话说到一半被自己的输出预算切断，是最安静的一种失败。把它和这个仓库前几个版本修过的
+失败摆在一起，它是唯一一个**每一层都是对的**：
+
+| 失败 | 谁能看出来 |
+|---|---|
+| 流断在半句 | `truncated`（v0.8 起留住半句） |
+| 连接被掐断 | `NetworkError`，带 kind |
+| 请求太大被拒 | `context overflow`，会降预算重试 |
+| **输出撞上限** | HTTP 200、JSON 合法、流走到收尾标记、`stopped_reason="done"`、退出码 0 |
+
+五家用四个词说同一件事，而且没有别的信号可言：
+
+| provider | 字段 | 值 |
+|---|---|---|
+| OpenAI / DeepSeek / Groq | `finish_reason` | `length` |
+| Anthropic | `stop_reason` | `max_tokens` |
+| Gemini | `finishReason` | `MAX_TOKENS` |
+| Bedrock | `stopReason` | `max_tokens` |
+
+以前这些词被存进 `Completion.stop_reason`，然后没有任何人读。循环只问「它有没有要工具」，
+于是**一个完整的响应**被当成了**一个完整的回答**。
+
+```console
+$ oneharness run "为什么客户端三秒就放弃了？"
+The timeout is 5 seconds, which is probably why the client gave up after three tries.
+[the answer above stopped at the output limit (openai stopped at the output token limit (stop_reason=length): this response is complete as a response and unfinished as an answer)]
+$ echo $?
+1
+```
+
+判定放在适配层：只有适配器认识那个词。`Provider._finish(completion, reason)` 把
+`stop_reason` 和「要不要 `cut_off`」一起定下来，五家各自调用一次，循环什么都不用知道。
+
+`--json` 里它是**独立字段**，不和 `interrupted` 合并：
+
+```json
+{
+  "text": "The timeout is 5 seconds, which is probably why the client gave up after three tries.",
+  "stopped_reason": "truncated",
+  "cut_off": "openai stopped at the output token limit (stop_reason=length): this response is complete as a response and unfinished as an answer"
+}
+```
+
+两个键分开是有理由的：`interrupted` 的意思是**丢了字节**，`cut_off` 的意思是**什么都没丢，
+只是停在了预算边上**。合成一句话，修法就错了——一个去查网络，一个去调 `max_tokens`。
+
+### 半个工具调用也执行
+
+输出在上限处切断时，模型可能正写到 `write_file` 的参数中间。这一条更难办：调用不能扔。
+一条声明了 `tool_calls` 却没有对应 `tool` 消息的 assistant 消息，每家 provider 都会拒绝，
+扔了就等于把整个请求也扔了。所以它照常执行，只是**参数被标成不完整**：
+
+```console
+  → write_file({"path": "app.conf", "content": "timeout=30
+retries=
+  ! write_file: error: tool arguments were cut off by the output limit
+[the answer above stopped at the output limit (...)]
+```
+
+标记而不是猜测：判据是那段 JSON **解不解析得出来**。`{"path": "app.conf"` 只差一个右括号，
+而 `{"path": "x"}` 是解出来的——按长度猜会把后者也判成坏的，把一次能用的请求变成一次报错。
+stream 路径和一次性响应走同一段代码（`mark_incomplete_arguments`），所以两条路上的结论一致。
+
+然后这一轮跑完就停：下一步要请求模型「接着刚被打断的那句话往下写」，而那是一个它没有预算
+继续的东西。
+
+`examples/limit_demo.py` 四段都是真跑的：真 CLI、真 SSE 服务器，服务器的最后一帧就是
+`finish_reason: length` 本身。**旧版本**的结论写在第 1 段的注释里——这是少数几个没法用
+「新旧实现同进程对照」演示的改动，因为旧版的表现就是「一切正常」。
 
 ## MCP
 
@@ -317,7 +394,7 @@ provider = create_provider("openai")
 delegator = Delegator(provider, default_tools("."), max_steps=6, max_parallel=4)
 agent = Agent(provider, Registry([*default_tools("."), delegator.tool(), delegator.batch_tool()]))
 print(agent.run("把 README 的错别字都找出来改成 PR").text)
-print(delegator.as_dict())   # {"runs": 3, "usage": {...}, "by_label": {...}}
+print(delegator.as_dict())  # {"runs": 3, "usage": {...}, "by_label": {...}}
 ```
 
 ## 一次派好几个子 agent
@@ -1204,6 +1281,13 @@ prompt 总量、`cached_tokens` 单列，而不是让上层去猜自己拿到的
 工具调用的增量也只是事件，不参与决策：`done` 里的那份完整参数仍是唯一被执行的版本。
 这样行为只有一套，`--json` 也照旧。
 
+**「答完了」和「话没说完」是两件事，而线上只有后者没有报错。** 输出撞上限时，
+HTTP 是 200、JSON 是合法的、流也走到了自己的收尾标记——错只在 `finish_reason` 那一个词上。
+不读它，这个失败就在每一层都伪装成成功：循环说 `done`、`--json` 说 `done`、退出码是 0。
+所以判定放在适配层（`Provider._finish`），因为只有适配器认识那个词；循环只负责把
+`truncated` 这个结论传下去，并且**不把它和 `interrupted` 混成一句**——一个丢了字节，
+一个什么都没丢，只是停在了预算边上。
+
 **截断和中断不是失败，但要如实说。** 流断了就返回 `stopped_reason="interrupted"`，退出码 1；
 Ctrl-C 退出码 130。把半句话当成完整答案是一种撒谎，把已经到达的半句话丢掉则是另一种。
 
@@ -1274,6 +1358,7 @@ $ python examples/tokens_demo.py             # 旧估算错在哪：中文 0.38x
 $ python examples/cache_demo.py              # 同一个循环，放断点后全价 token 少 60%
 $ python examples/shell_demo.py              # shell 工具的五种撒谎方式，新旧实现同进程对照
 $ python examples/trim_demo.py               # 裁剪留下的孤儿 tool 消息：旧代码被 400 拒掉
+$ python examples/limit_demo.py              # 撞上输出上限：200 + 合法 JSON + done 的那个失败
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

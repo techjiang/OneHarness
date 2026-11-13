@@ -101,6 +101,24 @@ class OpenAIProviderTests(unittest.TestCase):
         self.assertEqual(completion.text, "hi")
         self.assertEqual(completion.usage.input_tokens, 11)
         self.assertEqual(completion.stop_reason, "stop")
+        self.assertIsNone(completion.cut_off)
+
+    def test_finish_reason_length_is_read_not_stored(self):
+        # Non-streaming is the easier path to miss: there is no `truncated` to
+        # set, nothing throws, and the answer looks complete because it is.
+        reply = self.reply(
+            choices=[
+                {
+                    "message": {"role": "assistant", "content": "The timeout is"},
+                    "finish_reason": "length",
+                }
+            ]
+        )
+        with Recorder(reply) as server:
+            provider = OpenAIProvider("gpt-test", api_key="sk", base_url=server.url)
+            completion = provider.complete([Message.user("hello")])
+        self.assertEqual(completion.stop_reason, "length")
+        self.assertIn("output token limit", completion.cut_off)
         request = server.requests[0]
         self.assertEqual(request["path"], "/chat/completions")
         self.assertEqual(request["headers"]["authorization"], "Bearer sk")
@@ -177,6 +195,14 @@ class AnthropicProviderTests(unittest.TestCase):
         self.assertEqual(body["messages"], [{"role": "user", "content": "hello"}])
         self.assertEqual(server.requests[0]["headers"]["x-api-key"], "k")
         self.assertEqual(server.requests[0]["headers"]["anthropic-version"], "2023-06-01")
+
+    def test_max_tokens_is_a_cut_off_answer(self):
+        reply = self.reply([{"type": "text", "text": "the answer is"}], stop_reason="max_tokens")
+        with Recorder(reply) as server:
+            provider = AnthropicProvider("claude-test", api_key="k", base_url=server.url)
+            completion = provider.complete([Message.user("hello")])
+        self.assertEqual(completion.stop_reason, "max_tokens")
+        self.assertIn("output token limit", completion.cut_off)
 
     def test_tool_use_and_tool_result_folding(self):
         reply = self.reply(
