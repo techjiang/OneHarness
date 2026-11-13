@@ -165,8 +165,9 @@ def part_five() -> None:
         print(
             f"  {label}，{len(rows)} 个样本："
             f"平均 {new_mean * 100:.0f}%（chars/4 {old_mean * 100:.0f}%），"
-            f"最差 {rows[-1][0] * 100:.0f}%（chars/4 {rows[-1][1] * 100:.0f}%）"
+            f"中位 {rows[len(rows) // 2][0] * 100:.0f}%"
         )
+    print("  拟合集里还有一例比 chars/4 更差：越南语 0.66x（两个叠音符号，两种词表切法不同）")
     print("  留出集和拟合集一样好，才说明常数描述的是英文和代码，不是那几十个样本")
     print("  常数里没有一个是整数：整数的那个就是 chars/4")
     print("  重新拟合：python3 tools/calibrate_tokens.py（需要 pip install tiktoken，仅此一次）")
