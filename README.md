@@ -1329,13 +1329,26 @@ oneharness/
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            425 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            439 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
 examples/         十七个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
                   doctor / context / stream_tools / timing / network / network_kinds / tokens /
                   cache / shell / trim，都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
+
+## 屏幕截图（v1.7.0，最后一次更新）
+
+真终端输出，抓下来渲染的，没有手写：`tools` / `presets` / `doctor` / 测试与 ruff，
+以及 v1.7 输出上限、v1.6 裁剪、v1.5–1.4 shell、v1.2 token 估算、v1.3 缓存五组离线 demo。
+
+| | |
+|---|---|
+| ![CLI：版本 / 工具 / 预设](docs/screenshots/v1.7.0-1.png) | ![CI：测试 / ruff / doctor](docs/screenshots/v1.7.0-2.png) |
+| ![v1.7 输出上限](docs/screenshots/v1.7.0-3.png) | ![v1.6 裁剪](docs/screenshots/v1.7.0-4.png) |
+| ![v1.5–1.4 shell](docs/screenshots/v1.7.0-5.png) | ![v1.2 token 估算](docs/screenshots/v1.7.0-6.png) |
+
+![v1.3 缓存：工具循环把历史买了三遍](docs/screenshots/v1.7.0-7.png)
 
 ## 开发
 
