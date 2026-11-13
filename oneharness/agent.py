@@ -429,7 +429,7 @@ class Agent:
         for attempt in range(context_module.MAX_SHRINKS + 1):
             outgoing = messages
             if budget > 0:
-                outgoing, trim = context_module.fit(messages, budget)
+                outgoing, trim = context_module.fit(messages, budget, specs=list(specs))
                 if trim.changed:
                     used = trim
                     self._emit({"type": "context_trim", "step": step, **trim.as_dict()})
@@ -441,15 +441,15 @@ class Agent:
                 requests += 1
                 if attempt == context_module.MAX_SHRINKS or not context_module.is_overflow(exc):
                     raise
-                estimated = context_module.estimate(messages)
+                estimated = context_module.estimate(messages, list(specs))
                 budget = context_module.shrink(budget, estimated)
                 # Retrying with a payload the provider will refuse again only
                 # hides the real problem. If the smaller budget cannot remove a
                 # single character (a lone oversized prompt has no history to
                 # elide), the window is not what has to give -- the caller's
                 # prompt is, and that is not this loop's decision to make.
-                preview, _ = context_module.fit(messages, budget)
-                if context_module.estimate(preview) >= estimated:
+                preview, _ = context_module.fit(messages, budget, specs=list(specs))
+                if context_module.estimate(preview, list(specs)) >= estimated:
                     raise ProviderError(
                         "context overflow: the provider refused this request for size and "
                         "there is nothing left to elide (the prompt itself is over the "

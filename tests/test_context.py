@@ -1,6 +1,6 @@
 import unittest
 
-from oneharness import context
+from oneharness import context, tokens
 from oneharness.agent import Agent
 from oneharness.errors import ConfigError, ProviderError
 from oneharness.providers.base import Provider
@@ -68,16 +68,25 @@ def read_file(path: str) -> str:
 
 
 class EstimateTests(unittest.TestCase):
-    def test_estimate_counts_content_and_arguments(self):
+    def test_estimate_counts_content_arguments_and_schemas(self):
         message = Message.tool("c1", "a" * 40, "read_file")
-        self.assertEqual(context.estimate([message]), (40 + len("read_file")) // 4)
+        content_only = tokens.count_message(message)
+        self.assertEqual(context.estimate([message]), content_only)
         call = Message.assistant(
             "", [ToolCall.from_raw(call_id="c1", name="read_file", arguments={"path": "a"})]
         )
-        self.assertEqual(context.estimate([call]), (len("read_file") + len('{"path": "a"}')) // 4)
+        self.assertEqual(context.estimate([call]), tokens.count_message(call))
+        # The tool schemas ride along on every request and used to be counted
+        # as zero, so a budget never saw them.
+        specs = [{"name": "read_file", "description": "Read a file.", "parameters": {}}]
+        self.assertEqual(
+            context.estimate([message], specs), content_only + tokens.count_specs(specs)
+        )
 
-    def test_estimate_never_divides_by_zero(self):
-        self.assertEqual(context.estimate([Message.user("abc")], chars=0), 3)
+    def test_an_empty_message_list_is_zero_but_a_string_is_never_zero(self):
+        self.assertEqual(context.estimate([]), 0)
+        self.assertEqual(tokens.count("a"), 1)
+        self.assertEqual(tokens.count(""), 0)
 
 
 class FitTests(unittest.TestCase):
@@ -105,7 +114,9 @@ class FitTests(unittest.TestCase):
             ),
             Message.tool("c2", "new" * 1000, "read_file"),
         ]
-        fitted, trim = context.fit(messages, 1200)
+        # The budget is in the new estimate's units: eliding the first result is
+        # enough, so the second one must survive untouched.
+        fitted, trim = context.fit(messages, 1400)
         self.assertEqual(trim.elided, 1)
         self.assertIn("elided", fitted[2].content)
         self.assertEqual(fitted[4].content, messages[4].content)  # newest kept intact
@@ -173,11 +184,98 @@ class FitTests(unittest.TestCase):
         self.assertEqual(fitted[1].role, "user")  # Anthropic rejects a leading assistant turn
 
     def test_trim_as_dict_is_json_ready(self):
-        _, trim = context.fit([Message.user("x" * 8000)], 100)
+        message = Message.user("x" * 8000)
+        _, trim = context.fit([message], 100)
         payload = trim.as_dict()
-        self.assertEqual(payload["tokens_before"], 2000)
+        self.assertEqual(payload["tokens_before"], context.estimate([message]))
         self.assertEqual(payload["budget"], 100)
         self.assertIn("dropped", payload)
+        self.assertEqual(payload["tools"], 0)
+
+
+@tool
+def many_tools(path: str) -> str:
+    """A tool whose schema is a real part of every request."""
+    return path
+
+
+class SchemaTests(unittest.TestCase):
+    """The tool schemas are payload, and they used to be free."""
+
+    def test_a_budget_that_only_fits_without_the_tools_is_not_fitting(self):
+        specs = [many_tools.spec()] * 20
+        message = Message.user("hello")
+        self.assertLess(context.estimate([message]), 100)
+        self.assertGreater(context.estimate([message], specs), 1000)
+
+    def test_the_agent_counts_the_schemas_it_sends(self):
+        specs = [read_file.spec()] * 20
+        before = context.estimate([Message.user("hi")], specs)
+        after = context.estimate([Message.user("hi")])
+        self.assertGreater(before, after)
+
+    def test_trim_reports_the_schema_cost(self):
+        _, trim = context.fit([Message.user("x")], 1_000_000, specs=[read_file.spec()] * 10)
+        self.assertGreater(trim.tools, 0)
+        self.assertEqual(trim.as_dict()["tools"], trim.tools)
+
+
+class UnmetTests(unittest.TestCase):
+    """Trimming has a floor, and pretending otherwise is the bug."""
+
+    def test_tiny_results_are_not_replaced_by_a_longer_stub(self):
+        # Eliding "ok" into a 130-character explanation makes the request bigger.
+        messages = [Message.user("go")]
+        for index in range(8):
+            messages.append(
+                Message.assistant(
+                    "", [ToolCall.from_raw(call_id=f"c{index}", name="read_file", arguments={})]
+                )
+            )
+            messages.append(Message.tool(f"c{index}", "ok", "read_file"))
+        _, trim = context.fit(messages, 60)
+        self.assertEqual(trim.elided, 0)
+        self.assertGreater(trim.after, trim.before - 1)
+
+    def test_what_the_trimmer_cannot_reach_is_reported(self):
+        messages = [Message.system("be brief"), Message.user("x" * 4000)]
+        _, trim = context.fit(messages, 100)
+        self.assertEqual(trim.dropped, 0)  # the prompt is the only thing left
+        self.assertGreater(trim.unmet, 0)
+        self.assertEqual(trim.as_dict()["unmet"], trim.after - 100)
+
+    def test_a_trim_that_reaches_the_budget_reports_nothing_left(self):
+        messages = [Message.user("go"), Message.tool("c1", "y" * 8000, "read_file")]
+        _, trim = context.fit(messages, 500)
+        self.assertEqual(trim.unmet, 0)
+
+    def test_a_budget_smaller_than_the_schemas_says_so(self):
+        specs = [read_file.spec()] * 20
+        _, trim = context.fit([Message.user("hi")], 100, specs=specs)
+        self.assertGreater(trim.tools, trim.budget)
+        self.assertGreater(trim.unmet, 0)
+
+
+class LegacyComparisonTests(unittest.TestCase):
+    """The old rule is kept only so the change can be measured."""
+
+    def test_chinese_was_underestimated_by_a_factor_of_two(self):
+        text = "请帮我把这个仓库里的网络层重构一下，先看 transport 的错误分类。"
+        old = context.legacy_estimate([Message.user(text)])
+        new = context.estimate([Message.user(text)])
+        self.assertGreater(new, old * 2)
+
+    def test_indentation_was_overestimated_by_a_factor_of_twenty(self):
+        text = "    " * 2000
+        old = context.legacy_estimate([Message.user(text)])
+        new = context.estimate([Message.user(text)])
+        self.assertGreater(old, new * 10)
+
+    def test_english_is_where_the_old_rule_worked(self):
+        text = "the quick brown fox jumps over the lazy dog " * 20
+        old = context.legacy_estimate([Message.user(text)])
+        new = context.estimate([Message.user(text)])
+        self.assertLess(abs(new - old) / old, 0.25)
 
 
 class OverflowTests(unittest.TestCase):
@@ -233,9 +331,10 @@ class AgentBudgetTests(unittest.TestCase):
         self.assertEqual(len(result.messages), 6)  # transcript keeps every turn
 
     def test_an_overflow_triggers_one_honest_shrink(self):
-        # The first request is small; the second carries a 1000-token file and
-        # is refused. That is the shape of a real overrun: it happens mid-loop.
-        provider = OverflowThenOk(600, tool_reply("read_file", {"path": "a"}), text_reply("done"))
+        # The first request is small; the second carries a 500-token file and is
+        # refused against a 300-token window. That is the shape of a real
+        # overrun: it happens mid-loop, not on the first request.
+        provider = OverflowThenOk(300, tool_reply("read_file", {"path": "a"}), text_reply("done"))
         result = Agent(provider, [read_file], max_steps=3).run("look at a")
 
         self.assertEqual(result.text, "done")
@@ -245,7 +344,7 @@ class AgentBudgetTests(unittest.TestCase):
 
     def test_the_retry_budgets_even_when_none_was_configured(self):
         events = []
-        provider = OverflowThenOk(600, tool_reply("read_file", {"path": "a"}), text_reply("done"))
+        provider = OverflowThenOk(300, tool_reply("read_file", {"path": "a"}), text_reply("done"))
         agent = Agent(provider, [read_file], on_event=events.append)
         result = agent.run("look at a")
 
@@ -264,12 +363,16 @@ class AgentBudgetTests(unittest.TestCase):
     def test_it_gives_up_instead_of_looping(self):
         # The window is below what even the elided result costs, so no amount of
         # shrinking can help. The loop must stop on its own, not lean on --max-steps.
-        provider = OverflowThenOk(20, tool_reply("read_file", {"path": "a"}), text_reply("never"))
+        #
+        # One request, not five: the check is "did the smaller budget actually
+        # remove anything", and here it cannot, so retrying is provably useless.
+        # Spending four more requests to discover that would be the old behaviour.
+        provider = OverflowThenOk(5, tool_reply("read_file", {"path": "a"}), text_reply("never"))
         with self.assertRaises(ProviderError) as ctx:
             Agent(provider, [read_file], max_steps=4).run("look at a")
 
         self.assertEqual(ctx.exception.status, 400)
-        self.assertEqual(len(provider.sent), 1 + context.MAX_SHRINKS + 1)
+        self.assertEqual(len(provider.sent), 1)
 
     def test_a_wire_format_error_is_not_retried(self):
         provider = ScriptedProvider(

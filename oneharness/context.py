@@ -18,19 +18,23 @@ Two rules here:
   results are elided before anything is dropped, and the stub says what
   happened, so the model can ask again instead of assuming the file was empty.
 
-Counting is deliberately crude: characters over four. It is not a tokenizer,
-but it is provider-independent, cannot drift with a package upgrade, and errs
-high for code and JSON, which is what a tool loop is made of.
+Counting is a calibrated per-character-class estimate (`oneharness.tokens`),
+not a tokenizer. It is provider-independent and stable across package upgrades,
+but it is no longer a flat `chars / 4`: that guess was 0.38x on Chinese and 31x
+on indentation, so it wasted round trips on one and threw away context on the
+other. The tool schemas are counted too -- twenty tools are about 1600 tokens
+that no budget ever saw, on every request of a run.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Any
 
+from oneharness import tokens
 from oneharness.errors import ProviderError
 from oneharness.types import Message
 
-CHARS_PER_TOKEN = 4
 MIN_BUDGET = 256
 MAX_SHRINKS = 2
 
@@ -67,6 +71,15 @@ class Trim:
     after: int = 0
     elided: int = 0
     dropped: int = 0
+    # Tokens spent on the tool schemas, which are sent with every request and
+    # were previously not counted at all. Kept apart from `before`/`after`
+    # because a budget cannot elide them: either the tools fit or the tools fit.
+    tools: int = 0
+    # Tokens still over the budget after everything the trimmer is allowed to
+    # do. Non-zero means the request went out too big on purpose: the only
+    # things left to cut are the system prompt, the first user turn or the tool
+    # schemas, and each of those changes the question rather than shortening it.
+    unmet: int = 0
 
     @property
     def changed(self) -> bool:
@@ -79,25 +92,46 @@ class Trim:
             "tokens_after": self.after,
             "elided": self.elided,
             "dropped": self.dropped,
+            "tools": self.tools,
+            "unmet": self.unmet,
         }
 
 
-def estimate(messages: list[Message] | tuple[Message, ...], chars: int = CHARS_PER_TOKEN) -> int:
-    """Rough token count for a message list: characters, then divided down."""
+def estimate(
+    messages: list[Message] | tuple[Message, ...],
+    specs: list[dict[str, Any]] | None = None,
+) -> int:
+    """Estimated tokens for a request: the messages plus the tool schemas.
+
+    `specs` is part of the request, not decoration. Leaving it out is how a run
+    with twenty tools overshoots a budget by 1600 tokens and gets a 400 that
+    reads like a wire-format bug.
+    """
+    counted = sum(tokens.count_message(message) for message in messages)
+    return counted + tokens.count_specs(specs)
+
+
+def legacy_estimate(messages: list[Message] | tuple[Message, ...]) -> int:
+    """The v1.1 rule: every character counts as a quarter of a token.
+
+    Kept because the difference between this and `estimate` is the whole point
+    of v1.2, and a claim about an improvement needs the old number next to the
+    new one. Nothing in the harness calls it.
+    """
     total = 0
     for message in messages:
         total += len(message.content or "")
         total += len(message.name or "")
         for call in message.tool_calls:
             total += len(call.name) + len(call.arguments_text())
-    return total // max(1, chars)
+    return total // 4
 
 
 def fit(
     messages: list[Message],
     budget: int,
     *,
-    chars: int = CHARS_PER_TOKEN,
+    specs: list[dict[str, Any]] | None = None,
 ) -> tuple[list[Message], Trim]:
     """Return the messages to send plus a record of what was cut.
 
@@ -105,32 +139,43 @@ def fit(
     the default, so an agent that fitted before still behaves identically.
     """
     working = list(messages)
-    before = estimate(working, chars)
-    trim = Trim(budget=budget, before=before, after=before)
+    before = estimate(working, specs)
+    trim = Trim(budget=budget, before=before, after=before, tools=tokens.count_specs(specs))
     if budget <= 0 or before <= budget:
         return working, trim
 
-    trim.elided = _elide_results(working, budget, chars)
-    if estimate(working, chars) > budget:
-        trim.dropped = _drop_middle(working, budget, chars)
-    trim.after = estimate(working, chars)
+    trim.elided = _elide_results(working, budget, specs)
+    if estimate(working, specs) > budget:
+        trim.dropped = _drop_middle(working, budget, specs)
+    trim.after = estimate(working, specs)
+    trim.unmet = max(0, trim.after - budget)
     return working, trim
 
 
-def _elide_results(messages: list[Message], budget: int, chars: int) -> int:
-    """Blank the oldest tool results first: they are the reproducible part."""
+def _elide_results(messages: list[Message], budget: int, specs: list[dict[str, Any]] | None) -> int:
+    """Blank the oldest tool results first: they are the reproducible part.
+
+    A result shorter than the stub that replaces it is skipped. Eliding `ok`
+    into a 130-character explanation makes the request *bigger*: the trimmer
+    would then keep going, blanking every message it can reach and still
+    finishing over budget, which reads as "the budget is impossible" when the
+    truth is "this trade was not worth making".
+    """
     elided = 0
     for index, message in enumerate(messages):
-        if estimate(messages, chars) <= budget:
+        if estimate(messages, specs) <= budget:
             break
         if message.role != "tool" or not message.content:
             continue
-        messages[index] = replace(message, content=ELIDED.format(chars=len(message.content)))
+        stub = ELIDED.format(chars=len(message.content))
+        if len(stub) >= len(message.content):
+            continue
+        messages[index] = replace(message, content=stub)
         elided += 1
     return elided
 
 
-def _drop_middle(messages: list[Message], budget: int, chars: int) -> int:
+def _drop_middle(messages: list[Message], budget: int, specs: list[dict[str, Any]] | None) -> int:
     """Delete whole exchanges from the start, never splitting a call from its results.
 
     Splitting them would leave an orphan tool message, which OpenAI rejects
@@ -146,7 +191,7 @@ def _drop_middle(messages: list[Message], budget: int, chars: int) -> int:
     tail = _last_user_index(messages, head)
     dropped = 0
     index = head
-    while index < tail and estimate(messages, chars) > budget:
+    while index < tail and estimate(messages, specs) > budget:
         end = index + 1
         if messages[index].role == "assistant":
             while end < tail and messages[end].role == "tool":
@@ -190,12 +235,12 @@ def shrink(budget: int, estimated: int) -> int:
 
 
 __all__ = [
-    "CHARS_PER_TOKEN",
     "ELIDED",
     "MAX_SHRINKS",
     "MIN_BUDGET",
     "Trim",
     "estimate",
+    "legacy_estimate",
     "fit",
     "is_overflow",
     "shrink",

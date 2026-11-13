@@ -27,6 +27,7 @@ main:
                 python examples/timing_demo.py
                 python examples/network_demo.py
                 python examples/network_kinds_demo.py
+                python examples/tokens_demo.py
 
   pull_request:
     - stages:
@@ -54,3 +55,4 @@ main:
                 python examples/timing_demo.py
                 python examples/network_demo.py
                 python examples/network_kinds_demo.py
+                python examples/tokens_demo.py

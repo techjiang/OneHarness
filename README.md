@@ -2,7 +2,7 @@
 
 给工具调用型 LLM agent 用的一层薄 harness：**一套接口，接所有 provider**。
 
-不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做九件事：
+不引入任何第三方依赖（纯标准库），也不试图做成框架。它只做十件事：
 
 1. 把 OpenAI / Anthropic / Gemini / Bedrock / Azure 五种线格式抹平成同一个 `Completion`——
    包括 Bedrock 的请求签名和二进制流；
@@ -19,7 +19,9 @@
 8. 能说清慢在哪：`--timing` 把每一步拆成「等模型」和「等工具」，并给出首 token 时间；
 9. 不把网络故障丢给上层：连接被掐断、body 比声明短、`Retry-After` 要你等——都收敛成
    自己的错误类型和一句能读的话，退避也照对方说的等；而且**说清是哪种没答**：证书被拒、
-   代理要密码、域名解析不了、端口没人听，四种「没答」四种修法。
+   代理要密码、域名解析不了、端口没人听，四种「没答」四种修法；
+10. 数得清一个请求有多大：按字符类别估算 token 而不是 `chars / 4`（中文差 2.6 倍、
+   缩进差 32 倍），把工具 schema 也算进去，裁不动的时候如实说还差多少。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -442,7 +444,11 @@ big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉�
 
 两条规矩：
 
-- **裁的是请求，不是记录。** 只有发到线上的那份列表会被裁，`AgentResult.messages`
+- **估算是算出来的，不是猜出来的。** `chars / 4` 已经不在代码库里了。误差有方向时，
+「粗」是一个不成立的借口：算少了白挨一次 400，算多了白删一段塞得下的上下文。
+常数来自 `tiktoken` 的离线拟合，但 `tiktoken` 不进依赖——标定工具和运行时的库是两件事。
+
+**裁的是请求，不是记录。** 只有发到线上的那份列表会被裁，`AgentResult.messages`
   一条不少——一份既被截断又被当成记录的历史，比没有记录更糟。
 - **先丢最便宜的东西。** 工具结果可以再调一次拿回来，决定调用它的那段推理不行。
   所以结果先被抹成占位符，占位符里写着发生了什么，模型能自己决定要不要重调，
@@ -460,12 +466,12 @@ big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉�
    再发一次只会拿到同一个 400。于是直接报出 provider 的原话并说明原因——为了塞进窗口
    而丢掉用户的问题，那是在回答另一个问题。
 
-估算刻意做得很粗：字符数除以 4。它不是 tokenizer，但和 provider 无关、不会随某个
-包升级而漂移，而且对代码和 JSON（也就是工具循环的主要成分）是偏高而不是偏低。
-`--json` 里有 `trim` 字段，只在真的裁过时才出现：
+估算以前是字符数除以 4。v1.2 把它换掉了，原因见下一节——那个规则不是「粗」，
+是**有方向的错**。`--json` 里有 `trim` 字段，只在真的裁过时才出现：
 
 ```json
-"trim": {"budget": 1200, "tokens_before": 9438, "tokens_after": 36, "elided": 1, "dropped": 0}
+"trim": {"budget": 1200, "tokens_before": 18050, "tokens_after": 244,
+         "elided": 1, "dropped": 0, "tools": 0, "unmet": 0}
 ```
 
 `context_budget` 也能写进配置（`context_budget = 32000` 或
@@ -474,6 +480,75 @@ big.log 一共 40000 字节，比这个窗口大。上一次的结果被裁掉�
 
 `doctor` 也多了一个判定 `context`，和 `protocol` 共用同一个 400：一个说「请求被看懂了，
 只是太大」，一个说「请求本身不合法」。同样是红的，修的地方相反。
+
+## 估算 token：一个方向性的错误
+
+上一版写的是「估算刻意做得很粗：字符数除以 4」。这句话里有一半是对的——它确实
+和 provider 无关、不会漂移。但「粗」意味着误差不偏不倚，而它是有方向的：
+
+| 文本 | 字符 | 真实 tokens | `chars / 4` | 新估算 |
+|---|---|---|---|---|
+| 中文提问 | 666 | 435 | 166（**0.38x**） | 436（1.00x） |
+| 日文 | 264 | 184 | 66（**0.36x**） | 185（1.01x） |
+| 8KB 缩进 | 8000 | 63 | 2000（**31.75x**） | 64（1.02x） |
+| emoji | 1300 | 1001 | 325（0.32x） | 992（0.99x） |
+| 4KB 日志 | 4000 | 1610 | 1000（0.62x） | 1759（1.09x） |
+| 英文散文 | 784 | 193 | 196（1.02x） | 189（0.98x） |
+
+真值来自 `tiktoken`（`cl100k_base` 与 `o200k_base` 取平均），由
+`tools/calibrate_tokens.py` 录制后冻结成 `tests/fixtures/token_counts.json`。
+`chars / 4` 在这批样本上平均误差 **1.52x**，最差 **31.75x**；
+换掉之后平均 **1.05x**，最差 **1.52x**。而且两个方向都真实存在：
+
+- **中文被算少 2.6 倍。** 一个 2000 的预算会放出一个 5000 tokens 的请求，然后被
+  provider 拒掉，白跑一次往返。每个中文 prompt 都在付这笔钱。
+- **缩进被算多 32 倍。** 一个缩进很深的代码历史会被裁，而它其实塞得下。为了省
+  空间丢掉的上下文，是这条规则另一半的代价。
+
+所以 v1.2 换了算法：**按字符类别计费，词内按 run 合并**。下面都是 token/字符：
+空白 0.008、标点 0.47、CJK 0.84、假名 0.68、谚文 0.91、emoji 2.26。词内按 run 折算成
+字符/token：字母 4.15、数字 1.08、西里尔 2.63、希腊 1.40。另外三类长串单独处理：
+连续同一个字符（`"x" * 4000` 是 8 字符/token，`"=" * 4000` 是 230）、长 hex、base64
+形状的长串。常数是坐标下降拟合出来的，所以没有一个是整数——整数的那一个，就是
+`chars / 4`。
+
+**拟合集和留出集是分开的。** 前一半仓库源码进拟合集，后一半和 README 片段留出来
+不进——第一版跑完就抓到了这件事：常数在拟合集上 1.05x，在留出集上 1.10x，因为
+它把英文的字符/token 拟成了 3.42，而真实代码需要 4.15。现在留出集是
+**平均 1.04x、最差 1.10x**，和拟合集一样好，这才说明常数描述的是英文和代码，
+而不是那二十二个样本。
+
+**tokenizer 只是标定工具，不是依赖。** 运行时仍然零第三方依赖：`tiktoken` 只出现在
+`tools/calibrate_tokens.py` 里，它产出上面那份 fixture，测试和 demo 都拿 fixture 对账。
+这样「估算准不准」有一个仓库之外的证人，而「装 OneHarness」不需要装 40MB 的词汇表。
+
+顺手修的两处：
+
+- **工具 schema 以前算 0。** 20 个工具大约 1100 tokens，它躺在每一次请求里，
+  而预算从来看不见它。现在 `estimate(messages, specs)` 把它算上，`trim.tools` 单列。
+- **裁不动的时候不再沉默。** 缩到最小仍然超预算（剩下的只有 system、第一条 user
+  和工具 schema），以前是直接发出去；现在报 `still N tokens over: the rest is the
+  prompt itself`。另一头：把 `ok` 这种短结果换成 130 字的占位符只会让请求**更大**，
+  这种交换现在直接跳过。
+
+```console
+$ python3 examples/tokens_demo.py
+=== 2. 同一个窗口，两段历史，一个放行一个先裁 ===
+  中文工具结果，窗口取两数之间：7034
+    chars/4    4099 tokens -> 放行（以为塞得下）
+    新估算    9969 tokens -> 先裁 2 条工具结果
+
+  缩进很深的代码，窗口取两数之间：9986
+    chars/4   12649 tokens -> 先裁（删掉本来塞得下的内容）
+    新估算    7323 tokens -> 放行
+```
+
+重新拟合常数：
+
+```console
+$ pip install tiktoken && python3 tools/calibrate_tokens.py   # 只在这一步需要
+$ python3 tools/calibrate_tokens.py --check                   # 常数有没有漂
+```
 
 ## tape：录一次真流量，之后离线重放
 
@@ -806,6 +881,10 @@ model = "Qwen2.5-72B-Instruct"
 
 **usage 累加。** `result.usage` 是整个 run 的总和，不是最后一轮。
 
+**估算是算出来的，不是猜出来的。** `chars / 4` 已经不在代码库里了。误差有方向时，
+「粗」是一个不成立的借口：算少了白挨一次 400，算多了白删一段塞得下的上下文。
+常数来自 `tiktoken` 的离线拟合，但 `tiktoken` 不进依赖——标定工具和运行时的库是两件事。
+
 **裁的是请求，不是记录。** 上下文预算只在「发到线上」的那份列表上生效，
 `AgentResult.messages` 仍是一份完整的、可以拿去做下一轮 `history` 的记录。
 一份既被截断又被当成记录的历史，比没有记录更糟。
@@ -867,16 +946,20 @@ oneharness/
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
   builtin.py      文件/目录/shell 工具
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
-  context.py      上下文预算：估算、先 elide 工具结果、再丢整轮、溢出识别与降预算
+  tokens.py       按字符类别估算 token（常数由 tiktoken 离线拟合），零依赖
+  context.py      上下文预算：估算（含工具 schema）、先 elide 工具结果、再丢整轮、
+                  溢出识别、降预算、裁不动时如实报出还差多少
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
   doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/tls/proxy/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            338 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            373 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十二个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing / network / network_kinds，都不需要 API Key
+examples/         十三个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing / network / network_kinds / tokens，
+                  都不需要 API Key
+tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
 
 ## 开发
@@ -895,6 +978,7 @@ $ python examples/stream_tools_demo.py       # 工具调用在参数写完前露
 $ python examples/timing_demo.py             # 同样的墙钟、不同的元凶；并发把调用之和与墙钟拉开
 $ python examples/network_demo.py            # 真 socket：重置、半帧、Retry-After
 $ python examples/network_kinds_demo.py      # 真证书 / 真代理 / 域名 / 端口：四种「没答」
+$ python examples/tokens_demo.py             # 旧估算错在哪：中文 0.38x、缩进 31.75x
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

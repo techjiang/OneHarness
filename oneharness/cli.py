@@ -345,6 +345,13 @@ def _render(event: dict[str, Any], state: Any, stream: bool) -> None:
             f"(budget {event['budget']}, elided {event['elided']}, dropped {event['dropped']})",
             file=sys.stderr,
         )
+        # A trim that could not reach the budget is not a success, and it is not
+        # a silent overshoot either: say which part refused to shrink.
+        if event.get("unmet"):
+            left = f"{event['unmet']} tokens over"
+            if event.get("tools", 0) > event["budget"]:
+                left += f" -- the tool schemas alone are {event['tools']}"
+            print(f"{tag}! still {left}: the rest is the prompt itself", file=sys.stderr)
     elif kind == "context_overflow":
         print(
             f"{tag}! provider refused {event['estimated']} tokens; retrying under "

@@ -6,7 +6,7 @@ Three runs against a local fake OpenAI-compatible server that behaves like a
 real endpoint in the one way that matters here: it refuses any request whose
 prompt is over its window, and it says so in the provider's own words
 (`maximum context length is N tokens`). The tool result is a 40 KB log, so the
-second request of every run is about 10,000 tokens.
+second request of every run is about 18,000 tokens.
 
 The three runs are not variations of a setting; they are the three answers a
 harness can give:
@@ -36,7 +36,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from oneharness import doctor  # noqa: E402
+from oneharness import doctor, tokens  # noqa: E402
 from oneharness.errors import ProviderError  # noqa: E402
 
 WORKSPACE = Path(__file__).parent / ".demo-workspace"
@@ -45,13 +45,21 @@ LOG_BYTES = 40_000
 
 
 def estimate(payload: dict) -> int:
-    """A crude token count of the request body, the way a provider counts it."""
+    """Count the request body the way the provider will.
+
+    Not the v1.1 `chars / 4`: this fake window has to count like the real thing,
+    or the demo would be showing a harness doing arithmetic that the endpoint on
+    the other side does not share. How close `tokens.count` is to a real
+    tokenizer is `tokens_demo.py`'s question, and it answers it with numbers a
+    tokenizer recorded.
+    """
     chars = 0
     for message in payload.get("messages") or ():
-        chars += len(message.get("content") or "")
+        chars += tokens.count(message.get("content") or "")
         for call in message.get("tool_calls") or ():
-            chars += len(call["function"]["arguments"])
-    return chars // 4
+            chars += tokens.count(call["function"]["arguments"])
+    chars += tokens.count_specs(payload.get("tools") or [])
+    return chars
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -110,7 +118,7 @@ class Handler(BaseHTTPRequestHandler):
                     "message": {
                         "role": "assistant",
                         "content": (
-                            f"big.log 一共 {LOG_BYTES} 字节，约 {LOG_BYTES // 4} tokens，"
+                            f"big.log 一共 {LOG_BYTES} 字节，约 18000 tokens，"
                             "比这个窗口大。"
                             + ("上一次的结果被裁掉了，我手上只剩占位符。" if elided else "")
                         ),
@@ -221,7 +229,8 @@ def main() -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_port
     try:
-        print(f"fake window: {LIMIT} tokens · tool result: {LOG_BYTES} bytes (~{LOG_BYTES // 4})")
+        result_tokens = tokens.count((WORKSPACE / "big.log").read_text())
+        print(f"fake window: {LIMIT} tokens · tool result: {LOG_BYTES} bytes (~{result_tokens})")
 
         show(
             "1. --context-budget 1200：发之前就裁",
