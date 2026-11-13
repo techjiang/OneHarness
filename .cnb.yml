@@ -29,6 +29,7 @@ main:
                 python examples/network_kinds_demo.py
                 python examples/tokens_demo.py
                 python examples/cache_demo.py
+                python examples/shell_demo.py
 
   pull_request:
     - stages:
@@ -58,3 +59,4 @@ main:
                 python examples/network_kinds_demo.py
                 python examples/tokens_demo.py
                 python examples/cache_demo.py
+                python examples/shell_demo.py

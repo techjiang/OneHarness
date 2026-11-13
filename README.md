@@ -24,7 +24,10 @@
    缩进差 32 倍），把工具 schema 也算进去，裁不动的时候如实说还差多少；
 11. 知道哪些 token 是打折的：五种线格式的缓存字段各不相同（有的含在 prompt 里、
    有的不含），统一成一个 `Usage` 再报出来，Anthropic / Bedrock 还能顺手放好
-   缓存断点——工具循环每一步都重发整个历史，那两个 provider 不放就是每一步全价。
+   缓存断点——工具循环每一步都重发整个历史，那两个 provider 不放就是每一步全价；
+12. 不替 shell 撒谎：超时了也把已经打印出来的东西带回来，说杀了就真的杀掉整棵
+   进程树，`stderr` 和 `stdout` 按真实顺序混在一条管道里，二进制输出不当异常，
+   刷屏的输出边读边裁（保留头尾）。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -980,7 +983,70 @@ model = "Qwen2.5-72B-Instruct"
 | `run_shell(command)` | 跑一条 shell 命令，默认 60s 超时，需显式 `--shell` 开启 |
 
 文件工具都锁在 workspace 里，`../` 和指向外部的绝对路径直接拒绝。
-`run_shell` 默认关闭——它不是沙箱，开了就等于把 shell 交给模型。
+`run_shell` 默认关闭——它不是沙箱，开了就等于把 shell 交给模型。它的返回值语义见
+下面「shell 工具的五种撒谎方式」。
+
+## shell 工具的五种撒谎方式
+
+`run_shell` 是这个仓库里唯一能**静默地**骗到模型的东西：它的返回值是一个字符串，而
+一个错的字符串仍然是一个字符串——没有任何下游会因此报错。v1.3 的实现有五个地方在撒谎，
+每一个都跑 `examples/shell_demo.py` 就能看见前后对照。
+
+**1. 超时等于什么都不知道。** 一条打了四十个失败然后挂住的测试，最有价值的东西是那四十行。
+旧实现只回一句 `command timed out after 0.5s`，然后把输出扔掉——这是 v0.8 在流式上修过的
+那个错，换了一根管子又犯一次。
+
+```console
+v1.3  command timed out after 0.5s: echo 'test_a ... FAILED'; echo 'test_b ... FAILED'; sleep 5
+now   error: command timed out after 0.5s: ... (killed, exit_code=-15)
+      test_a ... FAILED
+      test_b ... FAILED
+```
+
+**2. 说杀了，其实没杀掉。** `shell=True` 握住的是 `/bin/sh`，而 `sh -c '... &'` 会留下
+孙进程。旧实现报完「超时」两秒后，那个子进程把它的文件写出来了——**这不是漏了资源回收，
+这是一句假话**。现在 `start_new_session=True` 起一个独立进程组，超时和 Ctrl-C 都按组
+`SIGTERM` → 0.5s → `SIGKILL`。
+
+```console
+v1.3  still alive -- it wrote its file
+now   gone, as claimed
+```
+
+**3. `stderr` 是拼接的，不是混流的。** `stdout` 和 `stderr` 各存一个 buffer 再拼起来，
+等于把先到的警告挪到后到的失败后面。模型读到的因果是反的。现在 `stderr=STDOUT`，
+一条管道，顺序就是命令自己选的顺序。
+
+```console
+v1.3  first / third / SECOND      <- 警告跑到了它警告的那件事后面
+now   first / SECOND / third
+```
+
+**4. 二进制输出抛异常。** `head -c 200 /dev/urandom` 是一条合法命令，旧实现回一个
+`UnicodeDecodeError`——模型什么都没学到，还没拿到退出码。现在用增量解码器配
+`errors="replace"`，顺便解决「一次 64 KB 读跨在字符中间」这个更细的问题：无状态解码会把
+中文的两半各换成一个替换符，一屏就是一片 `�`。
+
+**5. 刷屏的输出先吃机器再谈截断。** 120 MB 过管道：
+
+```
+v1.3  peak RSS +331 MB
+now   peak RSS  +0 MB, 0.06s
+```
+
+上限二十万字符必须**在读取过程中**生效，而不是读完再切——`capture_output` 会让每一个
+字节先进内存，而这正是 `yes` 这类命令的用法。另外保留的是**头 + 尾**而不是只有头：
+开头说明它开始做什么，结尾说明它为什么停。一个失败的测试跑是「一墙通过 + 末尾几条失败」，
+只留头等于留住了通过、丢掉了重点。
+
+```console
+a) 60 000 行通过，然后两行失败
+   v1.3  last line '... (truncated, 348949 chars total)'
+   now   last line '2 failed, 59998 passed'
+```
+
+还有一个不撒谎但会卡住的细节：继承了 `stdout` 的孙进程会让管道在 shell 退出后仍然开着，
+无休止地 `join` 读线程就是一个「命令明明跑完了但工具调用不返回」。所以读完有 1 秒宽限。
 
 ## 设计取舍
 
@@ -1005,6 +1071,10 @@ prompt 总量、`cached_tokens` 单列，而不是让上层去猜自己拿到的
 **裁的是请求，不是记录。** 上下文预算只在「发到线上」的那份列表上生效，
 `AgentResult.messages` 仍是一份完整的、可以拿去做下一轮 `history` 的记录。
 一份既被截断又被当成记录的历史，比没有记录更糟。
+
+**shell 工具的错误结果也是有内容的。** 工具失败不抛异常这条规矩，在 shell 上有一个额外
+要求：超时的错误结果里必须带着超时前打印的东西。否则「不炸循环」只是让模型继续往下走，
+而它手上没有任何依据。同理，杀掉进程组不是清理，是让「杀掉了」这句话成立。
 
 **没有内置重试模型决策。** provider 层的 429/5xx 会自动退避重试（`transport.py`），
 但「模型答得不对要不要重问」属于业务判断，交给调用方。
@@ -1061,7 +1131,7 @@ oneharness/
   agent.py        工具调用循环，on_event 可观测，stream=True 分流 token，工具可并发，
                   每步拆出 model / tool 两段耗时与首 token 时间
   delegate.py     子 agent：独立上下文、独立记账、标签、批量 fan-out、不能再委派
-  builtin.py      文件/目录/shell 工具
+  builtin.py      文件/目录/shell 工具；shell 边读边裁、按进程组杀、保留超时前的输出
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
   tokens.py       按字符类别估算 token（常数由 tiktoken 离线拟合），零依赖
   context.py      上下文预算：估算（含工具 schema）、先 elide 工具结果、再丢整轮、
@@ -1072,11 +1142,11 @@ oneharness/
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
-tests/            403 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+tests/            412 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十四个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing / network / network_kinds / tokens / cache，
-                  都不需要 API Key
+examples/         十五个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing / network / network_kinds / tokens / cache /
+                  shell，都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
 ```
 
@@ -1098,6 +1168,7 @@ $ python examples/network_demo.py            # 真 socket：重置、半帧、Re
 $ python examples/network_kinds_demo.py      # 真证书 / 真代理 / 域名 / 端口：四种「没答」
 $ python examples/tokens_demo.py             # 旧估算错在哪：中文 0.38x、缩进 31.75x
 $ python examples/cache_demo.py              # 同一个循环，放断点后全价 token 少 60%
+$ python examples/shell_demo.py              # shell 工具的五种撒谎方式，新旧实现同进程对照
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

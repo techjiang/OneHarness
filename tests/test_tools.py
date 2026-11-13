@@ -1,4 +1,6 @@
+import resource
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Literal
@@ -175,6 +177,112 @@ class BuiltinToolTests(unittest.TestCase):
         tool_obj = make_shell_tool(self.root, timeout=0.2)
         with self.assertRaises(ToolError):
             tool_obj("sleep 5")
+
+
+class ShellHonestyTests(unittest.TestCase):
+    """What the shell tool says has to match what the shell did.
+
+    Three claims it used to make that were not true: that a timeout means
+    nothing is known (the output up to the stall is known), that a command
+    which printed a line ended cleanly (that was only true for UTF-8), and that
+    a killed command is gone (the grandchildren were not).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_timeout_keeps_what_the_command_printed(self):
+        # The most valuable part of a timed-out answer: how far it got. A test
+        # suite that printed forty failures before hanging has said everything.
+        shell = make_shell_tool(self.root, timeout=0.4)
+        with self.assertRaises(ToolError) as ctx:
+            shell("echo first-line; echo second-line; sleep 5")
+        message = str(ctx.exception)
+        self.assertIn("timed out", message)
+        self.assertIn("first-line", message)
+        self.assertIn("second-line", message)
+        self.assertNotIn("after-the-stall", message)
+
+    def test_a_timeout_kills_the_whole_group_not_just_the_shell(self):
+        # `sh -c '... &'` leaves a grandchild that survives a kill aimed at the
+        # shell. The old implementation reported "killed" and the grandchild
+        # then wrote its file two seconds later -- verified, not imagined.
+        marker = self.root / "leaked.txt"
+        shell = make_shell_tool(self.root, timeout=0.4)
+        with self.assertRaises(ToolError):
+            shell(f"sh -c 'sleep 0.8; echo leaked > {marker}' & sleep 5")
+        time.sleep(1.2)
+        self.assertFalse(marker.exists(), "a process the tool killed was still alive")
+
+    def test_stderr_is_interleaved_not_appended(self):
+        # Two captured buffers concatenated afterwards reorder the transcript:
+        # the warning that came first lands last, and the cause reads after the
+        # effect. One pipe keeps the order the command chose.
+        shell = make_shell_tool(self.root)
+        output = shell("echo one; echo two >&2; echo three")
+        self.assertLess(output.index("one"), output.index("two"))
+        self.assertLess(output.index("two"), output.index("three"))
+
+    def test_binary_output_is_not_an_exception(self):
+        # `head -c 200 /dev/urandom` is a legitimate command. Answering it with
+        # `UnicodeDecodeError` tells the model nothing about what it ran -- and
+        # the decode happens across read boundaries, so the decoder has to be
+        # incremental or it mangles the characters it straddles.
+        shell = make_shell_tool(self.root)
+        output = shell("head -c 4000 /dev/urandom")
+        self.assertIn("exit_code=0", output)
+        self.assertGreater(len(output), 100)
+
+    def test_multibyte_characters_survive_chunk_boundaries(self):
+        # 中文 is three bytes per character; a 64 KB read ends mid-character
+        # fairly often at this size, and a stateless decoder replaces both
+        # halves with two replacement characters.
+        shell = make_shell_tool(self.root)
+        output = shell("python3 -c \"print('中文测试' * 30000, end='')\"")
+        self.assertIn("中文测试", output)
+        self.assertNotIn("\ufffd", output)
+
+    def test_a_wall_of_output_keeps_both_ends(self):
+        # The beginning says what it started doing, the end says why it stopped.
+        # Keeping only the head keeps the passes and loses the failures.
+        shell = make_shell_tool(self.root)
+        output = shell("seq 1 40000")
+        self.assertIn("dropped from the middle", output)
+        self.assertIn("\n1\n", output)
+        self.assertTrue(output.rstrip().endswith("40000"), output[-80:])
+        self.assertLess(len(output), 25_000)
+
+    def test_output_is_capped_while_reading_not_after(self):
+        # The cap has to be enforced during the read: `yes` writes 60 MB in
+        # 0.14s and `capture_output` holds every byte of it before anyone can
+        # truncate (measured 182 MB peak RSS for a one-line answer).
+        shell = make_shell_tool(self.root)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        output = shell("yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | head -c 40000000")
+        growth = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+        self.assertLess(len(output), 25_000)
+        self.assertLess(growth, 60, f"held {growth:.0f} MB of a 40 MB stream")
+
+    def test_a_command_that_ignores_sigterm_still_ends(self):
+        shell = make_shell_tool(self.root, timeout=0.3)
+        started = time.monotonic()
+        with self.assertRaises(ToolError):
+            shell("trap '' TERM; sleep 30")
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_a_talkative_grandchild_does_not_hang_the_call(self):
+        # A grandchild that inherited stdout keeps the pipe open after the shell
+        # exits; joining the reader without a grace period is a tool call that
+        # never returns for a command that already finished.
+        shell = make_shell_tool(self.root, timeout=5)
+        started = time.monotonic()
+        output = shell("nohup sleep 30 & echo done")
+        self.assertIn("done", output)
+        self.assertLess(time.monotonic() - started, 3.0)
 
 
 if __name__ == "__main__":
