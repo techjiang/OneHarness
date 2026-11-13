@@ -18,7 +18,8 @@
    请求层可 `--record` / `--replay` 成 tape，回放不需要 key 也不需要网络；
 8. 能说清慢在哪：`--timing` 把每一步拆成「等模型」和「等工具」，并给出首 token 时间；
 9. 不把网络故障丢给上层：连接被掐断、body 比声明短、`Retry-After` 要你等——都收敛成
-   自己的错误类型和一句能读的话，退避也照对方说的等。
+   自己的错误类型和一句能读的话，退避也照对方说的等；而且**说清是哪种没答**：证书被拒、
+   代理要密码、域名解析不了、端口没人听，四种「没答」四种修法。
 
 ```console
 $ oneharness run "看看 examples/app.conf 里的 timeout，太小了就改大"
@@ -390,7 +391,7 @@ $ oneharness doctor openai anthropic gemini
              not configured on this machine; set the key to test it
 ```
 
-七个判定：
+十一个判定：
 
 | 判定 | 含义 | 该动哪里 |
 |---|---|---|
@@ -401,8 +402,14 @@ $ oneharness doctor openai anthropic gemini
 | `quota` | 限流或余额 | 等，或换 key |
 | `protocol` | provider 说**我们的字段**不对 | OneHarness 的 bug |
 | `context` | 请求被看懂了，只是超过窗口 | 设 `context_budget`，或发少一点 |
-| `network` | 根本没答：DNS / TLS / 代理 / 超时 | 查网络 |
+| `tls` | 握手被拒：证书不被信任 | 查信任链 / 主机名 / base_url |
+| `proxy` | 有个代理挡在前面，说要密码 | 查 `HTTPS_PROXY` / `NO_PROXY` 和它的登录 |
+| `network` | 根本没答：域名 / 端口 / 超时 | 查网络 |
 | `unconfigured` | 本机没配这个 key | 配了再测 |
+
+`tls` 和 `proxy` 是 v1.1 从 `network` 里拆出来的：以前它们都报「查网络」——而网络
+明明是通的。拆开之前，一个 407 甚至会被判成 `protocol`，也就是「OneHarness 自己的 bug」，
+方向完全反了。详见下面「四种没答」。
 
 关键是 `auth` 和 `protocol` 不能混。401 说「key 无效」证明请求本身没问题；
 400 说「unknown name messages」意味着这个 harness 发错了体，换对 key 也修不好。
@@ -663,6 +670,68 @@ v0.9 结尾说「被掐断的流是能录进 tape 的」。**当时只在正常�
 现在三条路径（SSE / 二进制帧 / 普通 JSON）都在抛异常之前先把已收到的字节写进 tape。
 回放那段字节，会复现同一个截断——这是本地编不出来的证据。
 
+## 四种没答，四种修法
+
+「没答」是一个笼统的结论，底下是四件互不相干的事。它们以前共用一句话（`network`），
+现在各自有名字：
+
+```console
+$ python3 examples/network_kinds_demo.py
+=== 1. a certificate nobody trusts ===
+    error type     : NetworkError (kind=tls)
+    doctor verdict : tls
+    what to do     : the certificate was rejected: check trust store, hostname or base_url
+    the sentence   : [tls] TLS verification failed ... CERTIFICATE_VERIFY_FAILED ...
+=== 2. a proxy that answers 407 ===
+    doctor verdict : proxy
+    what to do     : a proxy is in the way and says no: check HTTPS_PROXY, NO_PROXY ...
+=== 3. a name that does not resolve ===
+    doctor verdict : network
+    the sentence   : [dns] cannot resolve ... Name or service not known
+=== 4. a port nobody listens on ===
+    the sentence   : [refused] nothing is listening at http://127.0.0.1:... Connection refused
+```
+
+第 1、2 段都是**真跑**：真的自签名证书、真的 TLS 握手、真的 CONNECT 隧道。它们不是
+「网络不通」——网络是通的，DNS 也对，`base_url` 一个字符都没错。给人一句「查查你的网络」，
+是把一个错诊断说得像结论。
+
+### 407 曾经被判成「这是 OneHarness 的 bug」
+
+`407` 是代理说的话，不是模型服务说的话。它对我们请求体的形状一无所知。而旧代码把
+**所有**没被 `classify` 特别处理的 400 系状态都归到 `protocol`，于是：
+
+```console
+$ HTTPS_PROXY=http://corp-proxy:3128 oneharness doctor openai
+✗ openai  protocol  request to ... failed | status=407     ← 错
+```
+
+`protocol` 的含义是「这个 harness 发错了体」——于是人去 `providers/` 里找一个根本没错的
+字段。现在它是 `proxy`，`_next_step` 也只说代理的事。
+
+### 重试是个赌注，有些赌注定输
+
+退避的隐含前提是「世界在 1.5 秒里变了」。一个没人信任的证书 1.5 秒后还是没人信任，一个
+要密码的代理还是一样要密码。所以错误自己带一个 `retryable`：
+
+```console
+$ python3 examples/network_kinds_demo.py     # 第 5 段
+  a bad certificate, retries=2: 0.03s
+    retryable=False  <- 退避没被付
+  a dropped connection, retries=2: 4.50s
+    retryable=True   <- 值得再试一次
+```
+
+同样的形状（都没有答案），相反的结论。三秒钟的静默之后拿到同一句话，是白等——而静默
+三秒在终端上和卡死一样。
+
+### 一个不该动的地方：`NetworkError` 仍然是 `ProviderError`
+
+agent 循环里那条「有半句话，留住它」的分支 `except ProviderError`。v1.0 刚刚修完
+「半句话被抛掉」的 bug，如果把网络错误做成 `ProviderError` 的兄弟类，它就会从那条分支
+底下溜过去，把半句话再丢一次。所以 `NetworkError` **继承** `ProviderError`，`status`
+保持 `None`（没人会把它读成 provider 主动拒绝），只是多了一个 `kind` 和一个 `hint`。
+
 ## 配置
 
 就近找 `oneharness.toml`（从当前目录逐级向上，最后看 `~/.config/`）：
@@ -800,13 +869,14 @@ oneharness/
   mcp.py          stdio JSON-RPC 的 MCP 客户端，把远端工具变成普通 Tool
   context.py      上下文预算：估算、先 elide 工具结果、再丢整轮、溢出识别与降预算
   tape.py         录/放真流量：存原始字节、严格匹配请求、header 永不落盘
-  doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/network...
+  doctor.py       一个最小真请求 + 把失败归到 auth/model/protocol/tls/proxy/network...
   config.py       TOML + 环境变量 + [[mcp]] + [delegate]
   cli.py          run / chat / tools / presets / doctor / config，含 --timing 摘要
-tests/            323 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape，
-                  以及用原始 socket 造出的 TCP 重置（假服务器造不出来）
-examples/         十一个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
-                  context / stream_tools / timing / network，都不需要 API Key
+  errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
+tests/            338 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
+                  原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
+examples/         十二个离线 demo：e2e / stream / mcp / delegate / fanout / bedrock / doctor /
+                  context / stream_tools / timing / network / network_kinds，都不需要 API Key
 ```
 
 ## 开发
@@ -824,6 +894,7 @@ $ python examples/context_demo.py            # 40KB 工具结果：先裁 / 被�
 $ python examples/stream_tools_demo.py       # 工具调用在参数写完前露面；流断了半句话还在
 $ python examples/timing_demo.py             # 同样的墙钟、不同的元凶；并发把调用之和与墙钟拉开
 $ python examples/network_demo.py            # 真 socket：重置、半帧、Retry-After
+$ python examples/network_kinds_demo.py      # 真证书 / 真代理 / 域名 / 端口：四种「没答」
 $ python -m unittest tests.test_resilience   # 真 RST 下的 CLI：退出码、半句话、无 traceback
 $ ruff check oneharness tests examples       # 风格（不格式化 Markdown 里的示例）
 ```

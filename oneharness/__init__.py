@@ -4,7 +4,13 @@ from oneharness.agent import Agent, AgentResult
 from oneharness.builtin import default_tools
 from oneharness.delegate import DelegationError, Delegator, make_delegate_tool
 from oneharness.doctor import Probe, check
-from oneharness.errors import ConfigError, OneHarnessError, ProviderError, ToolError
+from oneharness.errors import (
+    ConfigError,
+    NetworkError,
+    OneHarnessError,
+    ProviderError,
+    ToolError,
+)
 from oneharness.mcp import McpClient, connect_mcp
 from oneharness.providers import create_provider, list_presets
 from oneharness.tape import Tape, TapeError
@@ -20,7 +26,7 @@ from oneharness.types import (
     Usage,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "Agent",
@@ -32,6 +38,7 @@ __all__ = [
     "Delegator",
     "McpClient",
     "Message",
+    "NetworkError",
     "OneHarnessError",
     "Probe",
     "ProviderError",

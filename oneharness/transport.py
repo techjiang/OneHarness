@@ -20,8 +20,11 @@ from __future__ import annotations
 import http.client
 import io
 import json
+import socket
+import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
@@ -29,7 +32,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from oneharness import tape as tape_module
-from oneharness.errors import ProviderError
+from oneharness.errors import NetworkError, ProviderError
 
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
 
@@ -95,18 +98,18 @@ def post_json(
                 raw = _read_body(url, response, timeout=timeout)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
-            error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
+            error = _rejected(url, exc.code, text)
             if exc.code not in RETRY_STATUS or attempt == retries:
                 _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise error from None
             retry_after = _retry_after(exc.headers)
         except urllib.error.URLError as exc:
             error = _unreachable(url, exc.reason)
-            if attempt == retries:
+            if attempt == retries or not _worth_retrying(error):
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         except TimeoutError:
-            error = ProviderError(f"request to {url} timed out after {timeout}s")
+            error = NetworkError(f"request to {url} timed out after {timeout}s", kind="timeout")
             if attempt == retries:
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
@@ -137,7 +140,9 @@ def _read_body(url: str, response: Any, *, timeout: float = 120.0) -> bytes:
     try:
         return response.read()
     except TimeoutError:
-        raise ProviderError(f"reading the response from {url} stalled for {timeout}s") from None
+        raise NetworkError(
+            f"reading the response from {url} stalled for {timeout}s", kind="timeout"
+        ) from None
     except _LOST as exc:
         raise _lost(url, exc, mid=True) from None
 
@@ -190,18 +195,18 @@ def post_sse(
             response = urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
-            error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
+            error = _rejected(url, exc.code, text)
             if exc.code not in RETRY_STATUS or attempt == retries:
                 _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise error from None
             retry_after = _retry_after(exc.headers)
         except urllib.error.URLError as exc:
             error = _unreachable(url, exc.reason)
-            if attempt == retries:
+            if attempt == retries or not _worth_retrying(error):
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         except TimeoutError:
-            error = ProviderError(f"request to {url} timed out after {timeout}s")
+            error = NetworkError(f"request to {url} timed out after {timeout}s", kind="timeout")
             if attempt == retries:
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
@@ -273,18 +278,18 @@ def post_chunks(
             response = urllib.request.urlopen(request, timeout=timeout)
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")
-            error = ProviderError(f"request to {url} failed", status=exc.code, body=text)
+            error = _rejected(url, exc.code, text)
             if exc.code not in RETRY_STATUS or attempt == retries:
                 _record(tape, url, payload, exc.code, text.encode("utf-8"))
                 raise error from None
             retry_after = _retry_after(exc.headers)
         except urllib.error.URLError as exc:
             error = _unreachable(url, exc.reason)
-            if attempt == retries:
+            if attempt == retries or not _worth_retrying(error):
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
         except TimeoutError:
-            error = ProviderError(f"request to {url} timed out after {timeout}s")
+            error = NetworkError(f"request to {url} timed out after {timeout}s", kind="timeout")
             if attempt == retries:
                 _record(tape, url, payload, 0, str(error).encode("utf-8"))
                 raise error from None
@@ -320,20 +325,103 @@ def post_chunks(
         time.sleep(delay)
 
 
-def _unreachable(url: str, reason: Any) -> ProviderError:
-    """No answer arrived. Two different situations wear that same face.
+def _through_proxy(url: str) -> bool:
+    """Whether urllib would route this URL through a proxy at all.
 
-    DNS, TLS, a proxy and a refused port all mean the request never got
-    anywhere, so retrying is pointless but harmless. A reset *before* the first
-    byte means the connection was made and then dropped -- urllib reports it
-    here too, wrapped as a reason, and saying "cannot reach" about it would hide
-    that the server did accept the connection.
+    Not an implementation detail: when a proxy is configured, a refused
+    connection names the proxy, not the model host -- and those two are fixed in
+    completely different places.
     """
-    if isinstance(reason, OSError) and not isinstance(reason, urllib.error.URLError):
+    try:
+        scheme = urllib.parse.urlsplit(url).scheme
+        if not urllib.request.getproxies().get(scheme):
+            return False
+        return not urllib.request.proxy_bypass(urllib.parse.urlsplit(url).hostname or "")
+    except (ValueError, OSError):  # a URL we cannot parse is not our problem here
+        return False
+
+
+def _worth_retrying(error: ProviderError) -> bool:
+    """Whether another attempt could plausibly give a different answer.
+
+    A certificate that is untrusted now will still be untrusted in 1.5 seconds,
+    and a proxy that wants a password will still want it. Retrying those buys
+    three seconds of silence and then the same sentence -- the backoff is a bet
+    that the world changed, and here it provably did not.
+    """
+    return not isinstance(error, NetworkError) or error.retryable
+
+
+def _rejected(url: str, status: int, text: str) -> ProviderError:
+    """A status the provider sent, told apart from a proxy standing in the way.
+
+    407 comes from the proxy, not from the model host: it has nothing to say
+    about our request body, so classifying it as `protocol` ("this is a
+    OneHarness bug") sends the reader into `providers/` for a field that is not
+    wrong. It is a credential for a different system entirely.
+    """
+    if status == 407:
+        said = text.strip()[:200] or "no body, only the status"
+        return NetworkError(
+            f"the proxy in front of {url} refused the request (HTTP 407): {said}",
+            kind="proxy",
+            retryable=False,
+        )
+    return ProviderError(f"request to {url} failed", status=status, body=text)
+
+
+def _unreachable(url: str, reason: Any) -> ProviderError:
+    """No answer arrived. Five quite different situations wear that same face.
+
+    urllib hands all of them over as `URLError.reason`, so the only way to know
+    which one happened is to look at what that reason actually is. Getting this
+    wrong is not cosmetic: "cannot reach" about an untrusted certificate sends
+    someone to check their Wi-Fi, and about a proxy 407 sends them to look for a
+    password they will never find in this repo.
+    """
+    # `urllib` nests its own errors; unwrap until the real cause shows.
+    while isinstance(reason, urllib.error.URLError) and getattr(reason, "reason", None):
+        reason = reason.reason
+
+    name = type(reason).__name__
+    text = str(reason)
+
+    if isinstance(reason, ssl.SSLCertVerificationError) or name == "SSLCertVerificationError":
+        return NetworkError(
+            f"TLS verification failed for {url}: {text}", kind="tls", retryable=False
+        )
+    if isinstance(reason, ssl.SSLError) or name == "SSLError":
+        # Wrong version, handshake failure, a proxy speaking plain HTTP to an
+        # https port: all "the connection was refused at the TLS layer".
+        return NetworkError(f"TLS handshake failed for {url}: {text}", kind="tls", retryable=False)
+    if "tunnel connection failed" in text.lower():
+        # http.client raises a plain OSError whose only evidence is this text.
+        # 407 is the common case (proxy wants credentials); the rest is a proxy
+        # that is reachable and saying no.
+        return NetworkError(
+            f"the proxy in front of {url} refused: {text}", kind="proxy", retryable=False
+        )
+    if isinstance(reason, socket.gaierror) or name == "gaierror":
+        return NetworkError(f"cannot resolve {url}: {text}", kind="dns")
+    if isinstance(reason, ConnectionRefusedError) or name == "ConnectionRefusedError":
+        if _through_proxy(url):
+            # The connection that was refused is the one *to the proxy*: the
+            # model host was never contacted. Reporting the target URL as "not
+            # listening" sends someone to check a service that is fine.
+            return NetworkError(
+                f"the proxy configured for {url} refused the connection: {text}",
+                kind="proxy",
+                retryable=False,
+            )
+        return NetworkError(f"nothing is listening at {url}: {text}", kind="refused")
+    if isinstance(reason, TimeoutError) or name == "TimeoutError":
+        return NetworkError(f"no answer from {url} in time: {text}", kind="timeout")
+    if isinstance(reason, OSError):
         loss = ("ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError")
-        if type(reason).__name__ in loss:
+        if name in loss:
             return _lost(url, reason, mid=False)
-    return ProviderError(f"cannot reach {url}: {reason}")
+        return NetworkError(f"cannot reach {url}: {text}", kind="dns")
+    return NetworkError(f"cannot reach {url}: {text}", kind="dns")
 
 
 def _stream_broke(url: str, exc: BaseException, timeout: float) -> ProviderError:
@@ -344,7 +432,9 @@ def _stream_broke(url: str, exc: BaseException, timeout: float) -> ProviderError
     the network for a server that is simply slow to finish.
     """
     if isinstance(exc, TimeoutError):
-        return ProviderError(f"stream from {url} stalled for {timeout}s mid-response")
+        return NetworkError(
+            f"stream from {url} stalled for {timeout}s mid-response", kind="timeout"
+        )
     return _lost(url, exc, mid=True)
 
 
@@ -359,7 +449,10 @@ def _lost(url: str, exc: BaseException, *, mid: bool) -> ProviderError:
     """
     detail = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     where = "while reading the response" if mid else "before any answer"
-    return ProviderError(f"request to {url} lost the connection {where}: {detail}")
+    return NetworkError(
+        f"request to {url} lost the connection {where}: {detail}",
+        kind="timeout" if isinstance(exc, TimeoutError) else "lost",
+    )
 
 
 def _retry_after(headers: Any) -> float | None:

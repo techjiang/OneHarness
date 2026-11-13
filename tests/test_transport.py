@@ -76,9 +76,13 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(server.hits, 1)
 
     def test_connection_refused(self):
+        # Named as what it is, not as "cannot reach": a closed port is a running
+        # service or a firewall, while an unresolvable name is a host/URL typo.
+        # One message for both leaves the reader guessing which they have.
         with self.assertRaises(ProviderError) as ctx:
             post_json("http://127.0.0.1:1/v1", {}, retries=0)
-        self.assertIn("cannot reach", str(ctx.exception))
+        self.assertEqual(getattr(ctx.exception, "kind", None), "refused")
+        self.assertIn("nothing is listening", str(ctx.exception))
 
     def test_non_json_body(self):
         with (

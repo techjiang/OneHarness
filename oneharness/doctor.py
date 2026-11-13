@@ -13,7 +13,12 @@ fault** a failure is:
     quota       rate limited or out of credit
     protocol    a 400 that complains about *our* field names -- a OneHarness bug
     context     a 400/413 that says the payload is too big for the window
-    network     no answer at all: DNS, TLS, proxy, timeout
+    network     no answer at all, and *why*:
+                  dns      the name does not resolve
+                  refused  the port is closed
+                  tls      the certificate was rejected
+                  proxy    a proxy demanded credentials
+                  timeout  nothing came back in time
     unconfigured  no credentials in the environment; not a failure
 
 The distinction that earns its keep is `auth` vs `protocol`. A 401 saying
@@ -42,7 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from oneharness import context as context_module
-from oneharness.errors import ConfigError, OneHarnessError, ProviderError
+from oneharness.errors import ConfigError, NetworkError, OneHarnessError, ProviderError
 from oneharness.providers import PRESETS, create_provider, list_presets
 from oneharness.tape import TapeError
 from oneharness.types import Message
@@ -60,6 +65,8 @@ QUOTA = "quota"
 PROTOCOL = "protocol"
 CONTEXT = "context"
 NETWORK = "network"
+TLS = "tls"
+PROXY = "proxy"
 UNCONFIGURED = "unconfigured"
 
 # Bodies that blame our request rather than the credential. These are the ones
@@ -142,7 +149,7 @@ def check(preset: str, *, timeout: float = 20.0, **overrides: Any) -> Probe:
     started = time.monotonic()
     try:
         completion = provider.complete([Message.user(PING)])
-    except ProviderError as exc:
+    except ProviderError as exc:  # NetworkError included: `classify` tells them apart
         probe.status, probe.detail = classify(exc)
     except TapeError:
         # A mismatched tape is a broken fixture or a changed wire format, not a
@@ -170,8 +177,19 @@ def classify(exc: ProviderError) -> tuple[str, str]:
 
     detail = _first_sentence(body) or str(exc)
 
+    if isinstance(exc, NetworkError):
+        # `tls` and `proxy` are not reachability problems and must not be filed
+        # as one: a self-signed certificate behind a working network is fixed in
+        # a different place than a machine with no route out, and neither is
+        # fixed by "check your DNS".
+        if exc.kind in ("tls", "proxy"):
+            return (TLS if exc.kind == "tls" else PROXY), detail
+        return NETWORK, detail
     if status is None:
         return NETWORK, detail
+    if status == 407:
+        # A proxy talking, not the model host: it said nothing about our body.
+        return PROXY, detail
     if status in (401, 403):
         return AUTH, detail
     if status == 404:
@@ -210,7 +228,9 @@ def _next_step(status: str) -> str:
         QUOTA: "rate limited or out of credit: wait, or use another key",
         PROTOCOL: "the provider rejected the request body itself -- this is a OneHarness bug",
         CONTEXT: "the request was understood and was too big: set context_budget, or send less",
-        NETWORK: "no answer: DNS, TLS, proxy or timeout, not a credential problem",
+        NETWORK: "no answer: DNS, refused port or timeout -- not a credential problem",
+        TLS: "the certificate was rejected: check trust store, hostname or base_url",
+        PROXY: "a proxy is in the way and says no: check HTTPS_PROXY, NO_PROXY and its login",
         UNCONFIGURED: "not configured on this machine; set the key to test it",
     }[status]
 

@@ -787,6 +787,8 @@ def _print_probes(probes: Sequence[doctor_module.Probe]) -> None:
         doctor_module.QUOTA: "!",
         doctor_module.PROTOCOL: "✗",
         doctor_module.CONTEXT: "✗",
+        doctor_module.TLS: "✗",
+        doctor_module.PROXY: "✗",
         doctor_module.NETWORK: "✗",
         doctor_module.UNCONFIGURED: "-",
     }

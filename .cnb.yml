@@ -26,6 +26,7 @@ main:
                 python examples/stream_tools_demo.py
                 python examples/timing_demo.py
                 python examples/network_demo.py
+                python examples/network_kinds_demo.py
 
   pull_request:
     - stages:
@@ -52,3 +53,4 @@ main:
                 python examples/stream_tools_demo.py
                 python examples/timing_demo.py
                 python examples/network_demo.py
+                python examples/network_kinds_demo.py
