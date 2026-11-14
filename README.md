@@ -78,6 +78,15 @@ $ pip install -e .          # 需要 Python 3.11+
 $ oneharness --help
 ```
 
+不打 tag 也能拿到发布物：每个版本的 wheel 与 sdist 就在 `release/v<version>/` 下
+（`SHA256SUMS` 可校验，`RELEASE.md` 是该版本的发布说明）。
+
+```console
+$ pip install release/v1.7.0/oneharness-1.7.0-py3-none-any.whl
+$ oneharness --version
+oneharness 1.7.0
+```
+
 ## 命令行
 
 | 命令 | 作用 |
@@ -1331,10 +1340,11 @@ oneharness/
   errors.py       错误层级；NetworkError 带 kind（dns/refused/tls/proxy/timeout/lost）
 tests/            439 个单元测试，含本地 HTTP mock、真实 MCP 子进程、真端点录制的 tape、
                   原始 socket 造出的 TCP 重置、真 TLS 握手与真代理 CONNECT（假服务器造不出来）
-examples/         十七个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
+examples/         十八个离线 demo：e2e / stream / mcp / mcp_health / delegate / fanout / bedrock /
                   doctor / context / stream_tools / timing / network / network_kinds / tokens /
-                  cache / shell / trim，都不需要 API Key
+                  cache / shell / trim / limit，都不需要 API Key
 tools/            calibrate_tokens.py：唯一用到 tiktoken 的地方，拟合常数并录制 fixture
+release/          build.sh 就地打包 + 每个版本的 wheel/sdist/SHA256SUMS/RELEASE.md
 ```
 
 ## 屏幕截图（v1.7.0，最后一次更新）
